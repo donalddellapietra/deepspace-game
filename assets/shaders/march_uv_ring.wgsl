@@ -114,6 +114,80 @@ fn ring_recompute_cell(
     );
 }
 
+fn ring_point_in_shell(
+    p: vec3<f32>,
+    center: vec3<f32>,
+    r_lo: f32,
+    r_hi: f32,
+    y_lo: f32,
+    y_hi: f32,
+) -> bool {
+    let d = p - center;
+    let rho = length(d.xz);
+    return rho >= r_lo - 1e-5 && rho <= r_hi + 1e-5
+        && p.y >= y_lo - 1e-5 && p.y <= y_hi + 1e-5;
+}
+
+fn ring_shell_consider_t(
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    center: vec3<f32>,
+    r_lo: f32,
+    r_hi: f32,
+    y_lo: f32,
+    y_hi: f32,
+    t: f32,
+    best: f32,
+) -> f32 {
+    if t < 0.0 || t >= best { return best; }
+    let p = ray_origin + ray_dir * (t + 1e-5);
+    if ring_point_in_shell(p, center, r_lo, r_hi, y_lo, y_hi) {
+        return t;
+    }
+    return best;
+}
+
+fn ring_shell_entry_after(
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    center: vec3<f32>,
+    oc: vec3<f32>,
+    r_lo: f32,
+    r_hi: f32,
+    y_lo: f32,
+    y_hi: f32,
+    after: f32,
+) -> f32 {
+    let start_t = max(after, 0.0);
+    if ring_point_in_shell(ray_origin + ray_dir * start_t, center, r_lo, r_hi, y_lo, y_hi) {
+        return start_t;
+    }
+
+    var best = 1e20;
+
+    let r0_a = ring_radius_after(oc, ray_dir, max(r_lo, 1e-5), after);
+    best = ring_shell_consider_t(ray_origin, ray_dir, center, r_lo, r_hi, y_lo, y_hi, r0_a, best);
+    let r0_b = ring_radius_after(oc, ray_dir, max(r_lo, 1e-5), r0_a + 1e-5);
+    best = ring_shell_consider_t(ray_origin, ray_dir, center, r_lo, r_hi, y_lo, y_hi, r0_b, best);
+
+    let r1_a = ring_radius_after(oc, ray_dir, r_hi, after);
+    best = ring_shell_consider_t(ray_origin, ray_dir, center, r_lo, r_hi, y_lo, y_hi, r1_a, best);
+    let r1_b = ring_radius_after(oc, ray_dir, r_hi, r1_a + 1e-5);
+    best = ring_shell_consider_t(ray_origin, ray_dir, center, r_lo, r_hi, y_lo, y_hi, r1_b, best);
+
+    let y0 = ring_y_after(ray_origin, ray_dir, y_lo, after);
+    best = ring_shell_consider_t(ray_origin, ray_dir, center, r_lo, r_hi, y_lo, y_hi, y0, best);
+    let y1 = ring_y_after(ray_origin, ray_dir, y_hi, after);
+    best = ring_shell_consider_t(ray_origin, ray_dir, center, r_lo, r_hi, y_lo, y_hi, y1, best);
+
+    return best;
+}
+
+fn ring_top_cell_x(p: vec3<f32>, center: vec3<f32>, dims_x: i32, theta_step: f32) -> i32 {
+    let theta = atan2(p.z - center.z, p.x - center.x);
+    return clamp(i32(floor((theta + 3.14159265) / theta_step)), 0, dims_x - 1);
+}
+
 fn ring_next_cell_t(
     ray_origin: vec3<f32>,
     ray_dir: vec3<f32>,
@@ -396,48 +470,60 @@ fn march_uv_ring(
     let y_hi = center.y + half_side;
     let oc = ray_origin - center;
 
-    var best_t = 1e20;
-    var best = result;
-    for (var cell_x: i32 = 0; cell_x < dims_x; cell_x = cell_x + 1) {
+    var t = ring_shell_entry_after(
+        ray_origin, ray_dir_in, center, oc,
+        r_lo, r_hi, y_lo, y_hi,
+        -1e-5,
+    );
+
+    for (var iter: u32 = 0u; iter < 128u; iter = iter + 1u) {
+        if t >= 1e19 { break; }
+
+        let probe_t = max(t, 0.0) + 1e-5;
+        let probe = ray_origin + ray_dir_in * probe_t;
+        if !ring_point_in_shell(probe, center, r_lo, r_hi, y_lo, y_hi) {
+            t = ring_shell_entry_after(
+                ray_origin, ray_dir_in, center, oc,
+                r_lo, r_hi, y_lo, y_hi,
+                probe_t,
+            );
+            continue;
+        }
+
+        let cell_x = ring_top_cell_x(probe, center, dims_x, theta_step);
         let theta_lo = -pi + f32(cell_x) * theta_step;
         let theta_hi = theta_lo + theta_step;
-        let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, 0);
-        if sample.block_type == 0xFFFEu { continue; }
-
-        let cell_t = ring_top_entry_t(
-            ray_origin, ray_dir_in, center,
+        let t_next = ring_next_cell_t(
+            ray_origin, ray_dir_in, oc,
             theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi,
+            probe_t, 1e20,
         );
-        if cell_t >= best_t || cell_t >= 1e19 { continue; }
+        let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, 0);
 
         if sample.tag == 2u {
             let sub = march_uv_ring_anchor(
                 sample.child_idx,
                 ray_origin, ray_dir_in, center, oc,
-                cell_t,
-                best_t,
+                probe_t,
+                t_next,
                 theta_lo, theta_step,
                 r_lo, side,
                 y_lo, side,
             );
-            if sub.hit && sub.t < best_t {
-                best_t = sub.t;
-                best = sub;
-            }
-            continue;
+            if sub.hit { return sub; }
+        } else if sample.block_type != 0xFFFEu {
+            let pos_h = ray_origin + ray_dir_in * probe_t;
+            let uv_h = ring_coords(pos_h, center);
+            return make_ring_hit(
+                pos_h, center, probe_t, sample.block_type,
+                uv_h.x, uv_h.y, uv_h.z,
+                theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi,
+                theta_step, side, side,
+            );
         }
 
-        let pos_h = ray_origin + ray_dir_in * cell_t;
-        let uv_h = ring_coords(pos_h, center);
-        let hit = make_ring_hit(
-            pos_h, center, cell_t, sample.block_type,
-            uv_h.x, uv_h.y, uv_h.z,
-            theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi,
-            theta_step, side, side,
-        );
-        best_t = cell_t;
-        best = hit;
+        t = t_next + 1e-5;
     }
 
-    return best;
+    return result;
 }
