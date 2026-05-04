@@ -2,9 +2,11 @@
 
 use super::HitInfo;
 use crate::world::tree::{slot_index, Child, NodeId, NodeLibrary};
+use crate::world::uv_ring::{
+    uv_ring_angle_step, uv_ring_cell_side, uv_ring_height_lo, uv_ring_radial_lo,
+    UV_RING_BODY_CENTER,
+};
 
-const BODY_CENTER: [f32; 3] = [1.5, 1.5, 1.5];
-const BODY_SIZE: f32 = 3.0;
 const EPS: f32 = 1e-5;
 
 #[derive(Debug, Clone, Copy)]
@@ -18,17 +20,34 @@ struct RingGeom {
 
 #[derive(Debug, Clone, Copy)]
 struct RingCell {
-    tangent: [f32; 3],
-    radial: [f32; 3],
-    up: [f32; 3],
-    origin: [f32; 3],
-    scale: f32,
     theta_lo: f32,
     theta_hi: f32,
     radial_lo: f32,
     radial_hi: f32,
     height_lo: f32,
     height_hi: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RingShell {
+    theta_lo: f32,
+    theta_hi: f32,
+    radial_lo: f32,
+    radial_hi: f32,
+    height_lo: f32,
+    height_hi: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AnchorFrame {
+    node_id: NodeId,
+    cell: [i32; 3],
+    theta_org: f32,
+    r_org: f32,
+    y_org: f32,
+    theta_step: f32,
+    r_step: f32,
+    y_step: f32,
 }
 
 enum ResolvedCell {
@@ -70,87 +89,312 @@ pub fn cpu_raycast_uv_ring(
     let geom = ring_geom(dims);
     let dims_y = dims[1].max(1) as i32;
     let dims_z = dims[2].max(1) as i32;
-    let mut best: Option<HitInfo> = None;
+    let shell = RingShell {
+        theta_lo: -std::f32::consts::PI,
+        theta_hi: std::f32::consts::PI,
+        radial_lo: geom.radial_lo,
+        radial_hi: geom.radial_lo + geom.side * dims_y as f32,
+        height_lo: geom.height_lo,
+        height_hi: geom.height_lo + geom.side * dims_z as f32,
+    };
+    let oc = sub(cam_local, geom.center);
+    let mut t = shell_entry_after(cam_local, ray_dir, geom.center, shell, -EPS)?;
 
-    for cell_z in 0..dims_z {
-        for cell_y in 0..dims_y {
-            for cell_x in 0..dims[0] as i32 {
-                let Some(resolved) = resolve_uv_cell(
-                    library,
-                    ring_root,
-                    &frame_chain,
-                    [cell_x, cell_y, cell_z],
-                    slab_depth,
-                ) else {
-                    continue;
-                };
+    for _ in 0..512 {
+        if !t.is_finite() {
+            return None;
+        }
+        let probe_t = t.max(0.0) + EPS;
+        let probe = add(cam_local, mul(ray_dir, probe_t));
+        if !point_in_shell(probe, geom.center, shell) {
+            t = shell_entry_after(cam_local, ray_dir, geom.center, shell, probe_t)?;
+            continue;
+        }
 
-                let cell = ring_cell(&geom, cell_x, cell_y, cell_z);
-                let Some((t, face)) = curved_cell_hit(cell, geom.center, cam_local, ray_dir) else {
-                    continue;
-                };
+        let ring_uv = ring_coords(probe, geom.center);
+        let cell_x =
+            (((ring_uv[0] + std::f32::consts::PI) / geom.angle_step).floor() as i32)
+                .clamp(0, dims[0] as i32 - 1);
+        let cell_y = ((ring_uv[1] - geom.radial_lo) / geom.side)
+            .floor()
+            .clamp(0.0, dims_y as f32 - 1.0) as i32;
+        let cell_z = ((ring_uv[2] - geom.height_lo) / geom.side)
+            .floor()
+            .clamp(0.0, dims_z as f32 - 1.0) as i32;
+        let cell = ring_cell(&geom, cell_x, cell_y, cell_z);
+        let t_next = next_cell_t(cam_local, ray_dir, oc, cell, probe_t);
 
-                if let ResolvedCell::Anchor { mut path, node } = resolved {
-                    let absolute_slab_depth = frame_path.len() as u32 + slab_depth as u32;
-                    let cube_max_depth = _max_depth.saturating_sub(absolute_slab_depth).max(1);
-                    let entry = add(cam_local, mul(ray_dir, t + EPS));
-                    let mut local_origin = ring_point_to_cell_local(cell, entry);
-                    local_origin = [
-                        local_origin[0].clamp(EPS, 3.0 - EPS),
-                        local_origin[1].clamp(EPS, 3.0 - EPS),
-                        local_origin[2].clamp(EPS, 3.0 - EPS),
-                    ];
-                    let local_dir = ring_dir_to_cell_local(cell, ray_dir);
-                    if let Some(sub_hit) =
-                        super::cpu_raycast(library, node, local_origin, local_dir, cube_max_depth)
-                    {
-                        path.extend(sub_hit.path);
-                        let hit = HitInfo {
-                            path,
-                            face: sub_hit.face,
-                            t,
-                            place_path: None,
-                        };
-                        if best.as_ref().map(|old| hit.t < old.t).unwrap_or(true) {
-                            best = Some(hit);
-                        }
-                    }
-                    continue;
+        let Some(resolved) = resolve_uv_cell(
+            library,
+            ring_root,
+            &frame_chain,
+            [cell_x, cell_y, cell_z],
+            slab_depth,
+        ) else {
+            t = t_next + EPS;
+            continue;
+        };
+
+        match resolved {
+            ResolvedCell::Anchor { path, node } => {
+                let absolute_slab_depth = frame_path.len() as u32 + slab_depth as u32;
+                let remaining_depth = _max_depth.saturating_sub(absolute_slab_depth);
+                if remaining_depth == 0 {
+                    return Some(HitInfo {
+                        path,
+                        face: curved_face(cell, geom.center, probe),
+                        t: probe_t,
+                        place_path: None,
+                    });
                 }
-
-                let ResolvedCell::Uniform { path } = resolved else {
-                    unreachable!("anchor cells continue above");
-                };
-                let hit = HitInfo {
+                if let Some(hit) = raycast_uv_anchor(
+                    library,
+                    node,
                     path,
-                    face,
+                    geom.center,
+                    oc,
+                    ray_dir,
+                    probe_t,
+                    t_next,
+                    cell,
+                    geom.angle_step,
+                    geom.side,
+                    geom.side,
+                    remaining_depth,
+                ) {
+                    return Some(hit);
+                }
+            }
+            ResolvedCell::Uniform { path } => {
+                return Some(HitInfo {
+                    path,
+                    face: curved_face(cell, geom.center, probe),
+                    t: probe_t,
+                    place_path: None,
+                });
+            }
+        }
+
+        t = t_next + EPS;
+    }
+
+    None
+}
+
+fn raycast_uv_anchor(
+    library: &NodeLibrary,
+    node: NodeId,
+    mut path: Vec<(NodeId, usize)>,
+    center: [f32; 3],
+    oc: [f32; 3],
+    ray_dir: [f32; 3],
+    t_in: f32,
+    t_exit: f32,
+    slab_cell: RingCell,
+    slab_theta_step: f32,
+    slab_r_step: f32,
+    slab_y_step: f32,
+    max_depth: u32,
+) -> Option<HitInfo> {
+    let prefix_len = path.len();
+    let ray_origin = add(center, oc);
+    let mut t = t_in.max(0.0) + EPS;
+    let mut stack = Vec::with_capacity(max_depth as usize + 1);
+    stack.push(AnchorFrame {
+        node_id: node,
+        cell: clamp_cell(ring_recompute_cell(
+            ray_origin,
+            center,
+            ray_dir,
+            t,
+            slab_cell.theta_lo,
+            slab_cell.radial_lo,
+            slab_cell.height_lo,
+            slab_theta_step / 3.0,
+            slab_r_step / 3.0,
+            slab_y_step / 3.0,
+        )),
+        theta_org: slab_cell.theta_lo,
+        r_org: slab_cell.radial_lo,
+        y_org: slab_cell.height_lo,
+        theta_step: slab_theta_step / 3.0,
+        r_step: slab_r_step / 3.0,
+        y_step: slab_y_step / 3.0,
+    });
+
+    let mut iterations = 0u32;
+    let max_iterations = (max_depth.max(1) * 4096).max(8192);
+    loop {
+        if iterations >= max_iterations || stack.is_empty() || t > t_exit {
+            break;
+        }
+        iterations += 1;
+
+        let depth = stack.len() - 1;
+        let frame = stack[depth];
+        let cell = frame.cell;
+        if cell[0] < 0 || cell[0] > 2 || cell[1] < 0 || cell[1] > 2 || cell[2] < 0 || cell[2] > 2 {
+            stack.pop();
+            path.truncate(prefix_len + stack.len());
+            if stack.is_empty() {
+                break;
+            }
+            let parent_depth = stack.len() - 1;
+            stack[parent_depth].cell = ring_recompute_cell(
+                ray_origin,
+                center,
+                ray_dir,
+                t,
+                stack[parent_depth].theta_org,
+                stack[parent_depth].r_org,
+                stack[parent_depth].y_org,
+                stack[parent_depth].theta_step,
+                stack[parent_depth].r_step,
+                stack[parent_depth].y_step,
+            );
+            continue;
+        }
+
+        let cur_cell = RingCell {
+            theta_lo: frame.theta_org + cell[0] as f32 * frame.theta_step,
+            theta_hi: frame.theta_org + (cell[0] as f32 + 1.0) * frame.theta_step,
+            radial_lo: frame.r_org + cell[1] as f32 * frame.r_step,
+            radial_hi: frame.r_org + (cell[1] as f32 + 1.0) * frame.r_step,
+            height_lo: frame.y_org + cell[2] as f32 * frame.y_step,
+            height_hi: frame.y_org + (cell[2] as f32 + 1.0) * frame.y_step,
+        };
+        let t_next = next_cell_t(ray_origin, ray_dir, oc, cur_cell, t).min(t_exit);
+        let slot = slot_index(cell[0] as usize, cell[1] as usize, cell[2] as usize);
+        let node_ref = library.get(frame.node_id)?;
+
+        if path.len() > prefix_len + depth {
+            path[prefix_len + depth] = (frame.node_id, slot);
+        } else {
+            path.push((frame.node_id, slot));
+        }
+
+        match node_ref.children[slot] {
+            Child::Empty | Child::EntityRef(_) => {
+                t = advance_anchor_t(t_next, frame);
+                stack[depth].cell = ring_recompute_cell(
+                    ray_origin,
+                    center,
+                    ray_dir,
+                    t,
+                    frame.theta_org,
+                    frame.r_org,
+                    frame.y_org,
+                    frame.theta_step,
+                    frame.r_step,
+                    frame.y_step,
+                );
+            }
+            Child::Block(_) => {
+                let p = add(center, add(oc, mul(ray_dir, t)));
+                return Some(HitInfo {
+                    path,
+                    face: curved_face(cur_cell, center, p),
                     t,
                     place_path: None,
-                };
-                if best.as_ref().map(|old| hit.t < old.t).unwrap_or(true) {
-                    best = Some(hit);
+                });
+            }
+            Child::Node(child) | Child::PlacedNode { node: child, .. } => {
+                let child_node = library.get(child)?;
+                if child_node.representative_block == crate::world::tree::REPRESENTATIVE_EMPTY {
+                    t = advance_anchor_t(t_next, frame);
+                    stack[depth].cell = ring_recompute_cell(
+                        ray_origin,
+                        center,
+                        ray_dir,
+                        t,
+                        frame.theta_org,
+                        frame.r_org,
+                        frame.y_org,
+                        frame.theta_step,
+                        frame.r_step,
+                        frame.y_step,
+                    );
+                    continue;
                 }
+                if depth as u32 + 1 >= max_depth {
+                    let p = add(center, add(oc, mul(ray_dir, t)));
+                    return Some(HitInfo {
+                        path,
+                        face: curved_face(cur_cell, center, p),
+                        t,
+                        place_path: None,
+                    });
+                }
+                stack.push(AnchorFrame {
+                    node_id: child,
+                    cell: clamp_cell(ring_recompute_cell(
+                        ray_origin,
+                        center,
+                        ray_dir,
+                        t,
+                        cur_cell.theta_lo,
+                        cur_cell.radial_lo,
+                        cur_cell.height_lo,
+                        frame.theta_step / 3.0,
+                        frame.r_step / 3.0,
+                        frame.y_step / 3.0,
+                    )),
+                    theta_org: cur_cell.theta_lo,
+                    r_org: cur_cell.radial_lo,
+                    y_org: cur_cell.height_lo,
+                    theta_step: frame.theta_step / 3.0,
+                    r_step: frame.r_step / 3.0,
+                    y_step: frame.y_step / 3.0,
+                });
             }
         }
     }
 
-    best
+    None
+}
+
+fn ring_recompute_cell(
+    ray_origin: [f32; 3],
+    center: [f32; 3],
+    ray_dir: [f32; 3],
+    t: f32,
+    theta_org: f32,
+    r_org: f32,
+    y_org: f32,
+    theta_step: f32,
+    r_step: f32,
+    y_step: f32,
+) -> [i32; 3] {
+    let p = add(ray_origin, mul(ray_dir, t));
+    let uv = ring_coords(p, center);
+    [
+        ((uv[0] - theta_org) / theta_step).floor() as i32,
+        ((uv[1] - r_org) / r_step).floor() as i32,
+        ((uv[2] - y_org) / y_step).floor() as i32,
+    ]
+}
+
+fn clamp_cell(cell: [i32; 3]) -> [i32; 3] {
+    [
+        cell[0].clamp(0, 2),
+        cell[1].clamp(0, 2),
+        cell[2].clamp(0, 2),
+    ]
+}
+
+fn advance_anchor_t(t_next: f32, frame: AnchorFrame) -> f32 {
+    let eps = frame.theta_step.min(frame.r_step).min(frame.y_step) * 1e-4;
+    t_next + eps.max(1e-6)
 }
 
 fn ring_geom(dims: [u32; 3]) -> RingGeom {
-    let dims_x = dims[0].max(1) as f32;
-    let dims_y = dims[1].max(1) as f32;
-    let dims_z = dims[2].max(1) as f32;
-    let radius = BODY_SIZE * 0.38;
-    let side = ((2.0 * std::f32::consts::PI * radius / dims_x) * 0.95).max(BODY_SIZE / 27.0);
-    let angle_step = 2.0 * std::f32::consts::PI / dims_x;
-    let height = side * dims_z;
+    let side = uv_ring_cell_side(dims);
     RingGeom {
-        center: BODY_CENTER,
-        radial_lo: radius - side * dims_y * 0.5,
+        center: UV_RING_BODY_CENTER,
+        radial_lo: uv_ring_radial_lo(dims),
         side,
-        angle_step,
-        height_lo: BODY_CENTER[1] - height * 0.5,
+        angle_step: uv_ring_angle_step(dims),
+        height_lo: uv_ring_height_lo(dims),
     }
 }
 
@@ -158,24 +402,7 @@ fn ring_cell(geom: &RingGeom, cell_x: i32, cell_y: i32, cell_z: i32) -> RingCell
     let radial_lo = geom.radial_lo + cell_y as f32 * geom.side;
     let height_lo = geom.height_lo + cell_z as f32 * geom.side;
     let theta_lo = -std::f32::consts::PI + cell_x as f32 * geom.angle_step;
-    let theta_mid = theta_lo + geom.angle_step * 0.5;
-    let (sa, ca) = theta_mid.sin_cos();
-    let tangent = [-sa, 0.0, ca];
-    let radial = [ca, 0.0, sa];
-    let up = [0.0, 1.0, 0.0];
-    let radial_mid = (radial_lo + geom.side * 0.5).max(EPS);
-    let height_mid = height_lo + geom.side * 0.5;
-    let origin = [
-        geom.center[0] + radial[0] * radial_mid,
-        height_mid,
-        geom.center[2] + radial[2] * radial_mid,
-    ];
     RingCell {
-        tangent,
-        radial,
-        up,
-        origin,
-        scale: 3.0 / geom.side,
         theta_lo,
         theta_hi: theta_lo + geom.angle_step,
         radial_lo: radial_lo.max(EPS),
@@ -220,96 +447,103 @@ fn resolve_uv_cell(
     Some(ResolvedCell::Uniform { path })
 }
 
-fn ring_point_to_cell_local(cell: RingCell, p: [f32; 3]) -> [f32; 3] {
-    let d = sub(p, cell.origin);
-    [
-        dot(cell.tangent, d) * cell.scale + 1.5,
-        dot(cell.radial, d) * cell.scale + 1.5,
-        dot(cell.up, d) * cell.scale + 1.5,
-    ]
+fn ring_coords(p: [f32; 3], center: [f32; 3]) -> [f32; 3] {
+    let d = sub(p, center);
+    [(d[2]).atan2(d[0]), (d[0] * d[0] + d[2] * d[2]).sqrt(), p[1]]
 }
 
-fn ring_dir_to_cell_local(cell: RingCell, d: [f32; 3]) -> [f32; 3] {
-    [
-        dot(cell.tangent, d) * cell.scale,
-        dot(cell.radial, d) * cell.scale,
-        dot(cell.up, d) * cell.scale,
-    ]
+fn point_in_shell(p: [f32; 3], center: [f32; 3], shell: RingShell) -> bool {
+    let uv = ring_coords(p, center);
+    uv[0] >= shell.theta_lo - EPS
+        && uv[0] <= shell.theta_hi + EPS
+        && uv[1] >= shell.radial_lo - EPS
+        && uv[1] <= shell.radial_hi + EPS
+        && uv[2] >= shell.height_lo - EPS
+        && uv[2] <= shell.height_hi + EPS
 }
 
-fn curved_cell_hit(
-    cell: RingCell,
-    center: [f32; 3],
+fn shell_entry_after(
     origin: [f32; 3],
     dir: [f32; 3],
-) -> Option<(f32, u32)> {
+    center: [f32; 3],
+    shell: RingShell,
+    after: f32,
+) -> Option<f32> {
+    let start_t = after.max(0.0);
+    if point_in_shell(add(origin, mul(dir, start_t)), center, shell) {
+        return Some(start_t);
+    }
     let oc = sub(origin, center);
     let mut best = f32::INFINITY;
 
-    consider_t(0.0, cell, center, origin, dir, &mut best);
-
-    for radius in [cell.radial_lo, cell.radial_hi] {
+    for radius in [shell.radial_lo.max(EPS), shell.radial_hi] {
         for t in cylinder_roots_y(oc, dir, radius).into_iter().flatten() {
-            consider_t(t, cell, center, origin, dir, &mut best);
+            shell_consider_t(origin, dir, center, shell, t, after, &mut best);
         }
     }
-
-    if dir[1].abs() > 1e-8 {
-        for y in [cell.height_lo, cell.height_hi] {
-            consider_t(
-                (y - origin[1]) / dir[1],
-                cell,
-                center,
-                origin,
-                dir,
-                &mut best,
-            );
-        }
-    }
-
-    for theta in [cell.theta_lo, cell.theta_hi] {
+    for theta in [shell.theta_lo, shell.theta_hi] {
         if let Some(t) = meridian_t(oc, dir, theta) {
-            consider_t(t, cell, center, origin, dir, &mut best);
+            shell_consider_t(origin, dir, center, shell, t, after, &mut best);
+        }
+    }
+    if dir[1].abs() > 1e-8 {
+        for y in [shell.height_lo, shell.height_hi] {
+            shell_consider_t(origin, dir, center, shell, (y - origin[1]) / dir[1], after, &mut best);
         }
     }
 
-    best.is_finite().then(|| {
-        let p = add(origin, mul(dir, best));
-        (best, curved_face(cell, center, p))
-    })
+    best.is_finite().then_some(best)
 }
 
-fn consider_t(
-    t: f32,
-    cell: RingCell,
-    center: [f32; 3],
+fn shell_consider_t(
     origin: [f32; 3],
     dir: [f32; 3],
+    center: [f32; 3],
+    shell: RingShell,
+    t: f32,
+    after: f32,
     best: &mut f32,
 ) {
-    if t < -EPS || t >= *best {
+    if t <= after || t >= *best {
         return;
     }
-    let probe_t = t.max(0.0) + EPS;
-    let p = add(origin, mul(dir, probe_t));
-    if point_in_cell(cell, center, p) {
-        *best = t.max(0.0);
+    let p = add(origin, mul(dir, t + EPS));
+    if point_in_shell(p, center, shell) {
+        *best = t;
     }
 }
 
-fn point_in_cell(cell: RingCell, center: [f32; 3], p: [f32; 3]) -> bool {
-    let local = sub(p, center);
-    let rho = (local[0] * local[0] + local[2] * local[2]).sqrt();
-    let angle = local[2].atan2(local[0]);
-    rho >= cell.radial_lo - EPS
-        && rho <= cell.radial_hi + EPS
-        && p[1] >= cell.height_lo - EPS
-        && p[1] <= cell.height_hi + EPS
-        && angle_in_cell(angle, cell.theta_lo, cell.theta_hi)
-}
-
-fn angle_in_cell(angle: f32, lo: f32, hi: f32) -> bool {
-    angle >= lo - EPS && angle <= hi + EPS
+fn next_cell_t(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    oc: [f32; 3],
+    cell: RingCell,
+    after: f32,
+) -> f32 {
+    let mut best = f32::INFINITY;
+    for theta in [cell.theta_lo, cell.theta_hi] {
+        if let Some(t) = meridian_t(oc, dir, theta) {
+            if t > after && t < best {
+                best = t;
+            }
+        }
+    }
+    for radius in [cell.radial_lo.max(EPS), cell.radial_hi] {
+        for t in cylinder_roots_y(oc, dir, radius).into_iter().flatten() {
+            if t > after && t < best {
+                best = t;
+            }
+        }
+    }
+    if dir[1].abs() > 1e-8 {
+        for y in [cell.height_lo, cell.height_hi] {
+            let t = (y - origin[1]) / dir[1];
+            if t > after && t < best {
+                best = t;
+            }
+        }
+    }
+    best
 }
 
 fn cylinder_roots_y(oc: [f32; 3], dir: [f32; 3], radius: f32) -> [Option<f32>; 2] {
@@ -573,4 +807,5 @@ mod tests {
             "edit depth 18 should not return the whole anchor subtree",
         );
     }
+
 }

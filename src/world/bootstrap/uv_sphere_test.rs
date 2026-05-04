@@ -2,7 +2,7 @@
 //!
 //! Diagnostic UV ring world.
 //!
-//! Content is stored as a straight `[27, 2, 2]` UV lattice under a
+//! Content is stored as a straight `[27, 2, 5]` UV lattice under a
 //! `UvRing` root. The render path maps those rows into a cylinder, so
 //! placement and tangent rotation come from the same UV coordinate
 //! instead of rounded Cartesian sphere samples.
@@ -18,7 +18,9 @@ use crate::world::tree::{
 const GRID_DEPTH: u8 = super::DEFAULT_WRAPPED_PLANET_SLAB_DEPTH;
 const GRID_SIZE: usize = 27;
 const CELL_SUBTREE_DEPTH: u8 = 20;
-const RING_DIMS: [u32; 3] = [super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 2, 2];
+const SOLID_Z_OFFSET: usize = 2;
+const SOLID_Z_ROWS: usize = 3;
+const RING_DIMS: [u32; 3] = [super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 2, (SOLID_Z_OFFSET + SOLID_Z_ROWS) as u32];
 
 #[inline]
 #[cfg(test)]
@@ -104,7 +106,7 @@ pub(super) fn uv_sphere_test_world() -> WorldState {
         build_uniform_cartesian_subtree(&mut library, block::GRASS, CELL_SUBTREE_DEPTH);
     let stone_content =
         build_uniform_cartesian_subtree(&mut library, block::STONE, CELL_SUBTREE_DEPTH);
-    for z in 0..RING_DIMS[2] as usize {
+    for z in SOLID_Z_OFFSET..(SOLID_Z_OFFSET + SOLID_Z_ROWS) {
         for y in 0..RING_DIMS[1] as usize {
             let content = if y == 0 {
                 stone_content
@@ -186,10 +188,14 @@ mod tests {
     }
 
     #[test]
-    fn ring_lattice_is_two_by_two() {
+    fn ring_lattice_has_bottom_leeway_and_three_solid_rows() {
         assert_eq!(
             RING_DIMS,
-            [super::super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 2, 2]
+            [
+                super::super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0],
+                2,
+                (SOLID_Z_OFFSET + SOLID_Z_ROWS) as u32,
+            ]
         );
     }
 
@@ -222,7 +228,7 @@ mod tests {
     #[test]
     fn ring_rows_are_populated_in_uv_lattice() {
         let world = uv_sphere_test_world();
-        for z in 0..RING_DIMS[2] as usize {
+        for z in SOLID_Z_OFFSET..(SOLID_Z_OFFSET + SOLID_Z_ROWS) {
             for y in 0..RING_DIMS[1] as usize {
                 for x in 0..RING_DIMS[0] as usize {
                     let mut node_id = world.root;
@@ -252,7 +258,7 @@ mod tests {
             let mut node_id = world.root;
             for level in (0..GRID_DEPTH as u32).rev() {
                 let div = 3usize.pow(level);
-                let slot = slot_index(0, (y / div) % 3, 0);
+                let slot = slot_index(0, (y / div) % 3, (SOLID_Z_OFFSET / div) % 3);
                 let node = world.library.get(node_id).expect("node exists");
                 match node.children[slot] {
                     Child::Node(child) => node_id = child,

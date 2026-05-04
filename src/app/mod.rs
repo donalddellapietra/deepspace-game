@@ -15,7 +15,7 @@ use crate::world::palette::ColorRegistry;
 use crate::world::state::WorldState;
 use crate::world::tree::MAX_DEPTH;
 
-use self::uv_ring::{
+use crate::world::uv_ring::{
     cartesian_dir_in_path, uv_ring_cell_dir_to_stick_root, uv_ring_cell_frame,
     uv_ring_cell_coords_from_path, uv_ring_cell_frame_at_local_x, uv_ring_cell_path,
 };
