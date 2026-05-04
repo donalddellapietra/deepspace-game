@@ -159,16 +159,13 @@ impl App {
             cell_local[0] -= WORLD_SIZE;
             cell_x += 1;
         }
-        while cell_local[2] < 0.0 {
+        while cell_local[2] < 0.0 && cell_z > 0 {
             cell_local[2] += WORLD_SIZE;
             cell_z -= 1;
         }
-        while cell_local[2] >= WORLD_SIZE {
+        while cell_local[2] >= WORLD_SIZE && cell_z + 1 < dims[2] as i32 {
             cell_local[2] -= WORLD_SIZE;
             cell_z += 1;
-        }
-        if !(0..dims[2] as i32).contains(&cell_z) {
-            return;
         }
         let cell_x = cell_x.rem_euclid(dims[0] as i32) as u32;
         let cell_z = cell_z as u32;
@@ -448,5 +445,66 @@ mod tests {
         let slab_depth = 3;
         let path = uv_ring_cell_path(21, 2, slab_depth);
         assert_eq!(uv_ring_cell_coords_from_path(&path, dims, slab_depth), None);
+    }
+
+    #[test]
+    fn one_layer_vertical_exit_keeps_boundary_cell_with_outside_local_z() {
+        let dims = [27, 1, 1];
+        let slab_depth = 3;
+        let pos = world_pos_from_frame_local_unclamped(
+            &uv_ring_cell_path(13, 0, slab_depth),
+            [1.5, 1.5, WORLD_SIZE + 0.25],
+            5,
+        );
+        assert_eq!(
+            uv_ring_cell_coords_from_path(&pos.anchor, dims, slab_depth),
+            Some((13, 0)),
+        );
+        let local = pos.in_frame(&uv_ring_cell_path(13, 0, slab_depth));
+        assert!(local[2] > WORLD_SIZE, "local should remain above the only row: {local:?}");
+    }
+
+    #[test]
+    fn two_layer_vertical_exit_can_enter_neighbor_row() {
+        let dims = [27, 1, 2];
+        let slab_depth = 3;
+        let mut cell_local = [1.5, 1.5, WORLD_SIZE + 0.25];
+        let mut cell_z = 0i32;
+        while cell_local[2] >= WORLD_SIZE && cell_z + 1 < dims[2] as i32 {
+            cell_local[2] -= WORLD_SIZE;
+            cell_z += 1;
+        }
+        let pos = world_pos_from_frame_local_unclamped(
+            &uv_ring_cell_path(13, cell_z as u32, slab_depth),
+            cell_local,
+            5,
+        );
+        assert_eq!(
+            uv_ring_cell_coords_from_path(&pos.anchor, dims, slab_depth),
+            Some((13, 1)),
+        );
+    }
+
+    #[test]
+    fn two_layer_vertical_exit_past_top_keeps_top_row_with_outside_local_z() {
+        let dims = [27, 1, 2];
+        let slab_depth = 3;
+        let mut cell_local = [1.5, 1.5, WORLD_SIZE + 0.25];
+        let mut cell_z = 1i32;
+        while cell_local[2] >= WORLD_SIZE && cell_z + 1 < dims[2] as i32 {
+            cell_local[2] -= WORLD_SIZE;
+            cell_z += 1;
+        }
+        let pos = world_pos_from_frame_local_unclamped(
+            &uv_ring_cell_path(13, cell_z as u32, slab_depth),
+            cell_local,
+            5,
+        );
+        assert_eq!(
+            uv_ring_cell_coords_from_path(&pos.anchor, dims, slab_depth),
+            Some((13, 1)),
+        );
+        let local = pos.in_frame(&uv_ring_cell_path(13, 1, slab_depth));
+        assert!(local[2] > WORLD_SIZE, "local should remain above top row: {local:?}");
     }
 }
