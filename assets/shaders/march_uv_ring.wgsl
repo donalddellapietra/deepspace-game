@@ -27,11 +27,6 @@ fn march_uv_ring(
     var best_t = 1e20;
     var best: HitResult = result;
     for (var cell_x: i32 = 0; cell_x < dims_x; cell_x = cell_x + 1) {
-        let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, 0);
-        if sample.block_type == 0xFFFEu {
-            continue;
-        }
-
         let angle = -pi + (f32(cell_x) + 0.5) * angle_step;
         let sa = sin(angle);
         let ca = cos(angle);
@@ -52,7 +47,41 @@ fn march_uv_ring(
             dot(up, ray_dir_in) * scale,
         );
 
+        let inv_local = vec3<f32>(
+            select(1e10, 1.0 / local_dir.x, abs(local_dir.x) > 1e-8),
+            select(1e10, 1.0 / local_dir.y, abs(local_dir.y) > 1e-8),
+            select(1e10, 1.0 / local_dir.z, abs(local_dir.z) > 1e-8),
+        );
+        let cube_box = ray_box(local_origin, inv_local, vec3<f32>(0.0), vec3<f32>(3.0));
+        if cube_box.t_enter >= cube_box.t_exit || cube_box.t_exit <= 0.0 {
+            continue;
+        }
+
+        let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, 0);
+        if sample.block_type == 0xFFFEu {
+            continue;
+        }
+
         if sample.tag == 2u {
+            let aabb_bits = aabbs[sample.child_idx] & 0xFFFu;
+            if aabb_bits == 0u {
+                continue;
+            }
+            let amin = vec3<f32>(
+                f32(aabb_bits & 3u),
+                f32((aabb_bits >> 2u) & 3u),
+                f32((aabb_bits >> 4u) & 3u),
+            );
+            let amax = vec3<f32>(
+                f32(((aabb_bits >> 6u) & 3u) + 1u),
+                f32(((aabb_bits >> 8u) & 3u) + 1u),
+                f32(((aabb_bits >> 10u) & 3u) + 1u),
+            );
+            let content_box = ray_box(local_origin, inv_local, amin, amax);
+            if content_box.t_enter >= content_box.t_exit || content_box.t_exit <= 0.0 {
+                continue;
+            }
+
             let sub = march_in_tangent_cube(sample.child_idx, local_origin, local_dir);
             if sub.hit && sub.t < best_t {
                 let local_hit = local_origin + local_dir * sub.t;
@@ -77,12 +106,6 @@ fn march_uv_ring(
                 best = out;
             }
         } else if sample.tag == 1u {
-            let inv_local = vec3<f32>(
-                select(1e10, 1.0 / local_dir.x, abs(local_dir.x) > 1e-8),
-                select(1e10, 1.0 / local_dir.y, abs(local_dir.y) > 1e-8),
-                select(1e10, 1.0 / local_dir.z, abs(local_dir.z) > 1e-8),
-            );
-            let cube_box = ray_box(local_origin, inv_local, vec3<f32>(0.0), vec3<f32>(3.0));
             if cube_box.t_enter < cube_box.t_exit && cube_box.t_exit > 0.0 {
                 let t_local = max(cube_box.t_enter, 0.0);
                 if t_local < best_t {
