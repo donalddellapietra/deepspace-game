@@ -321,6 +321,66 @@ fn uv_ring_descend_anchor(
     return result;
 }
 
+struct UvRingLocalCellRay {
+    origin: vec3<f32>,
+    dir: vec3<f32>,
+    inv_dir: vec3<f32>,
+}
+
+fn uv_ring_local_cell_ray(
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    center: vec3<f32>,
+    lon: f32,
+    radius: f32,
+    shell: f32,
+) -> UvRingLocalCellRay {
+    let sa = sin(lon);
+    let ca = cos(lon);
+    let radial = vec3<f32>(ca, 0.0, sa);
+    let tangent = vec3<f32>(-sa, 0.0, ca);
+    let up = vec3<f32>(0.0, 1.0, 0.0);
+    let cube_origin = center + radial * radius;
+    let scale = 3.0 / shell;
+    let d_origin = ray_origin - cube_origin;
+    var out: UvRingLocalCellRay;
+    out.origin = vec3<f32>(
+        dot(tangent, d_origin) * scale + 1.5,
+        dot(radial, d_origin) * scale + 1.5,
+        dot(up, d_origin) * scale + 1.5,
+    );
+    out.dir = vec3<f32>(
+        dot(tangent, ray_dir) * scale,
+        dot(radial, ray_dir) * scale,
+        dot(up, ray_dir) * scale,
+    );
+    out.inv_dir = vec3<f32>(
+        select(1e10, 1.0 / out.dir.x, abs(out.dir.x) > 1e-8),
+        select(1e10, 1.0 / out.dir.y, abs(out.dir.y) > 1e-8),
+        select(1e10, 1.0 / out.dir.z, abs(out.dir.z) > 1e-8),
+    );
+    return out;
+}
+
+fn uv_ring_content_aabb_hit(local: UvRingLocalCellRay, child_idx: u32) -> bool {
+    let aabb_bits = aabbs[child_idx] & 0xFFFu;
+    if aabb_bits == 0u {
+        return false;
+    }
+    let amin = vec3<f32>(
+        f32(aabb_bits & 3u),
+        f32((aabb_bits >> 2u) & 3u),
+        f32((aabb_bits >> 4u) & 3u),
+    );
+    let amax = vec3<f32>(
+        f32(((aabb_bits >> 6u) & 3u) + 1u),
+        f32(((aabb_bits >> 8u) & 3u) + 1u),
+        f32(((aabb_bits >> 10u) & 3u) + 1u),
+    );
+    let hit = ray_box(local.origin, local.inv_dir, amin, amax);
+    return hit.t_enter < hit.t_exit && hit.t_exit > 0.0;
+}
+
 fn march_uv_ring(
     ring_idx: u32,
     body_origin: vec3<f32>,
@@ -359,6 +419,18 @@ fn march_uv_ring(
     var best = result;
     var best_t = 1e20;
     for (var cell_x: i32 = 0; cell_x < dims_x; cell_x = cell_x + 1) {
+        let lon_center = -pi + (f32(cell_x) + 0.5) * lon_step;
+        let local = uv_ring_local_cell_ray(ray_origin, ray_dir, center, lon_center, radius, shell);
+        let broad = ray_box(
+            local.origin,
+            local.inv_dir,
+            vec3<f32>(-0.25),
+            vec3<f32>(3.25),
+        );
+        if broad.t_enter >= broad.t_exit || broad.t_exit <= 0.0 || broad.t_enter >= best_t {
+            continue;
+        }
+
         let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, 0);
         if sample.block_type == 0xFFFEu {
             continue;
@@ -389,6 +461,10 @@ fn march_uv_ring(
         }
 
         if sample.tag == 2u {
+            if !uv_ring_content_aabb_hit(local, sample.child_idx) {
+                if ENABLE_STATS { ray_steps_would_cull = ray_steps_would_cull + 1u; }
+                continue;
+            }
             let sub = uv_ring_descend_anchor(
                 sample.child_idx,
                 ray_origin,
