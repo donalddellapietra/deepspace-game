@@ -137,9 +137,7 @@ impl App {
             }
             ActiveFrameKind::UvRing { dims, slab_depth } => {
                 let frame_path = self.active_frame.render_path;
-                let cam_local = self.camera.position.in_frame_rot(
-                    &self.world.library, self.world.root, &frame_path,
-                );
+                let cam_local = self.camera_local_for_active_frame(&self.active_frame);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
                 let hit = raycast::cpu_raycast_uv_ring(
                     &self.world.library,
