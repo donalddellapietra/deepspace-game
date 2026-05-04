@@ -624,7 +624,7 @@ impl App {
             self.camera.position.zoom_in_in_world(
                 &self.world.library, self.world.root,
             );
-        } else {
+        } else if !self.zoom_out_uv_ring_to_overview_if_needed() {
             self.camera.position.zoom_out_in_world(
                 &self.world.library, self.world.root,
             );

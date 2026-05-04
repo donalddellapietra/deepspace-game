@@ -146,6 +146,40 @@ impl App {
         );
     }
 
+    pub(super) fn zoom_out_uv_ring_to_overview_if_needed(&mut self) -> bool {
+        let Some(root) = self.world.library.get(self.world.root) else {
+            return false;
+        };
+        let crate::world::tree::NodeKind::UvRing { dims, slab_depth } = root.kind else {
+            return false;
+        };
+        if dims[0] == 0 || dims[1] == 0 || dims[2] == 0 {
+            return false;
+        }
+        let current_depth = self.camera.position.anchor.depth();
+        if current_depth == 0 || current_depth > slab_depth {
+            return false;
+        }
+        let Some((cell_x, cell_y, cell_z)) =
+            uv_ring_cell_coords_from_path(&self.camera.position.anchor, dims, slab_depth)
+        else {
+            return false;
+        };
+
+        let cell_path = uv_ring_cell_path(cell_x, cell_y, cell_z, slab_depth);
+        let cell_local = self.camera.position.in_frame_rot(
+            &self.world.library,
+            self.world.root,
+            &cell_path,
+        );
+        let root_local =
+            uv_ring_cell_frame_at_local_x(dims, slab_depth, cell_x, cell_y, cell_z, cell_local[0])
+                .point_to_ring_world(cell_local);
+        self.camera.position =
+            WorldPos::from_frame_local(&Path::root(), root_local, current_depth - 1);
+        true
+    }
+
     pub(super) fn exit_uv_ring_cell_if_needed(&mut self, previous_position: WorldPos) {
         let Some(root) = self.world.library.get(self.world.root) else {
             return;

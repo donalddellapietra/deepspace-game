@@ -107,9 +107,9 @@ pub(super) fn uv_sphere_test_world() -> WorldState {
     for z in 0..RING_DIMS[2] as usize {
         for y in 0..RING_DIMS[1] as usize {
             let content = if y == 0 {
-                grass_content
-            } else {
                 stone_content
+            } else {
+                grass_content
             };
             for x in 0..RING_DIMS[0] as usize {
                 let idx = grid_index(x, y, z);
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn ring_radial_layers_have_distinct_blocks() {
         let world = uv_sphere_test_world();
-        for (y, expected_block) in [(0usize, block::GRASS), (1usize, block::STONE)] {
+        for (y, expected_block) in [(0usize, block::STONE), (1usize, block::GRASS)] {
             let mut node_id = world.root;
             for level in (0..GRID_DEPTH as u32).rev() {
                 let div = 3usize.pow(level);
