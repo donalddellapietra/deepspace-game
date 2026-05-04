@@ -59,6 +59,7 @@ pub mod input_handlers;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod overlay_integration;
 pub mod test_runner;
+pub mod uv_ring;
 
 pub use frame::{
     compute_render_frame, with_render_margin, ActiveFrame,
@@ -513,6 +514,18 @@ impl App {
     pub(super) fn render_frame(&self) -> ActiveFrame {
         let mut logical_path = self.camera.position.anchor;
         let desired_depth = logical_path.depth().saturating_sub(RENDER_FRAME_K);
+        // UvRing world: prefer the inside-cell frame when the
+        // camera anchor traverses a cell's slab path AND the
+        // camera-local position is close to the ring band; fall
+        // back to the overview otherwise. Both branches keep the
+        // camera in cell-local representation so position recovery
+        // never goes through the storage column.
+        if let Some(frame) = self.uv_ring_cell_render_frame(desired_depth) {
+            return frame;
+        }
+        if let Some(frame) = self.uv_ring_overview_frame() {
+            return frame;
+        }
         logical_path.truncate(desired_depth);
         // The render frame's root must be Cartesian or WrappedPlane —
         // never a TangentBlock. The shader's TB dispatch fires at TB
@@ -536,6 +549,7 @@ impl App {
     }
 
     pub(super) fn update(&mut self, dt: f32) {
+        self.ensure_uv_ring_camera_anchor_local();
         // Camera-relative continuous flight (Minecraft-creative-style).
         // W/S follow camera forward (with pitch — looking down + W
         // dives), A/D follow camera right, Space/Shift go world ±Y.
@@ -553,6 +567,7 @@ impl App {
             if self.keys.shift { delta[1] -= 1.0; }
             let len = crate::world::sdf::length(delta);
             if len > 1e-6 {
+                let previous_position = self.camera.position;
                 let speed_cells_per_sec = 4.0;
                 let scale = speed_cells_per_sec * dt / len;
                 // `delta` is in WORLD axes (camera basis is in world
@@ -581,9 +596,12 @@ impl App {
                     &self.world.library,
                     self.world.root,
                 );
+                self.exit_uv_ring_cell_if_needed(previous_position);
+                self.ensure_uv_ring_camera_anchor_local();
             }
         }
         player::update(&mut self.camera, dt);
+        self.ensure_uv_ring_camera_anchor_local();
         // Advance entities by velocity * dt. WorldPos renormalizes
         // so cell-boundary crossings are handled transparently; on
         // worlds with a defined sea level, `tick` zeroes the Y
@@ -634,22 +652,46 @@ impl App {
         );
     }
 
-    pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
-        let cam_local = match frame.kind {
+    /// Camera position in the active frame's local `[0, 3)³`.
+    /// Most kinds resolve via `in_frame_rot`. The UvRing overview
+    /// is special: the camera state is in cell-local
+    /// representation (anchor on slab path), so we recover the
+    /// cell-local position and run it back through
+    /// `point_to_world` to get the camera at its ring topology
+    /// position in the UvRing's `[0, 3)³`.
+    pub(super) fn camera_local_for_active_frame(
+        &self,
+        frame: &ActiveFrame,
+    ) -> [f32; 3] {
+        use crate::app::uv_ring::{
+            uv_ring_cell_frame, uv_ring_cell_path, uv_ring_cell_x_from_path,
+        };
+        match frame.kind {
             ActiveFrameKind::Cartesian
             | ActiveFrameKind::WrappedPlane { .. }
-            | ActiveFrameKind::UvRing { .. } => {
-                // Rotation-aware: when the anchor path crosses a
-                // TangentBlock, every slot offset past it (and the
-                // final offset) must be rotated by the cumulative
-                // chain rotation. Plain `in_frame` walks Cartesian
-                // and gets the wrong world position for cameras
-                // inside a rotated subtree.
-                self.camera.position.in_frame_rot(
-                    &self.world.library, self.world.root, &frame.render_path,
-                )
+            | ActiveFrameKind::UvRingCell { .. } => self.camera.position.in_frame_rot(
+                &self.world.library, self.world.root, &frame.render_path,
+            ),
+            ActiveFrameKind::UvRing { dims, slab_depth } => {
+                if let Some(cell_x) =
+                    uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth)
+                {
+                    let cell_path = uv_ring_cell_path(cell_x, slab_depth);
+                    let cell_local = self.camera.position.in_frame_rot(
+                        &self.world.library, self.world.root, &cell_path,
+                    );
+                    uv_ring_cell_frame(dims, slab_depth, cell_x).point_to_world(cell_local)
+                } else {
+                    self.camera.position.in_frame_rot(
+                        &self.world.library, self.world.root, &frame.render_path,
+                    )
+                }
             }
-        };
+        }
+    }
+
+    pub(super) fn gpu_camera_for_frame(&self, frame: &ActiveFrame) -> crate::world::gpu::GpuCamera {
+        let cam_local = self.camera_local_for_active_frame(frame);
         if self.startup_profile_frames < 4 {
             eprintln!(
                 "gpu_camera frame_kind={:?} render_path={:?} logical_path={:?} cam_local={:?}",

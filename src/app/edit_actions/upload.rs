@@ -351,6 +351,13 @@ impl App {
                 ActiveFrameKind::UvRing { dims, slab_depth } => {
                     renderer.set_root_kind_uv_ring(dims, slab_depth);
                 }
+                // Inside-cell view: the GPU's frame root is the cell
+                // content (Cartesian / TB head). The shader runs the
+                // standard Cartesian DDA on it, so the renderer
+                // reports the root kind as Cartesian. The UvRing
+                // topology stays a no-op for the shader at this
+                // frame.
+                ActiveFrameKind::UvRingCell { .. } => renderer.set_root_kind_cartesian(),
             }
         }
         self.last_pack_ms = pack_elapsed.as_secs_f64() * 1000.0;

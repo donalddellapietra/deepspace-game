@@ -377,17 +377,7 @@ impl App {
         // wry IPC + evaluate_script. WASM: JS queues + window.__onGameState.
         if self.overlay_active() {
             self.poll_ui_commands();
-            let camera_local = match self.active_frame.kind {
-                crate::app::ActiveFrameKind::Cartesian
-                | crate::app::ActiveFrameKind::WrappedPlane { .. }
-                | crate::app::ActiveFrameKind::UvRing { .. } => {
-                    self.camera.position.in_frame_rot(
-                        &self.world.library,
-                        self.world.root,
-                        &self.active_frame.render_path,
-                    )
-                }
-            };
+            let camera_local = self.camera_local_for_active_frame(&self.active_frame);
             // Camera position in root-frame world coords (rotation-
             // aware so the value is correct even when the anchor
             // crosses a TangentBlock).
@@ -415,6 +405,9 @@ impl App {
                 }
                 crate::app::ActiveFrameKind::UvRing { dims, slab_depth } => {
                     format!("UvRing(dims={dims:?}, slab_d={slab_depth})")
+                }
+                crate::app::ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x } => {
+                    format!("UvRingCell(dims={dims:?}, slab_d={slab_depth}, cell_x={cell_x})")
                 }
             };
             let render_path_csv = self

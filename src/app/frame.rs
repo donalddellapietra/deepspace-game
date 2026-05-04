@@ -20,11 +20,21 @@ pub enum ActiveFrameKind {
     /// at depth==0; the slab's `(dims, slab_depth)` are uploaded as
     /// `Uniforms.slab_dims`.
     WrappedPlane { dims: [u32; 3], slab_depth: u8 },
-    /// The render frame is rooted at a `NodeKind::UvRing` node.
-    /// The shader dispatches `march_uv_ring` at ribbon level 0;
-    /// the slab's `(dims, slab_depth)` carry the cell count and
-    /// storage depth.
+    /// **Overview**: render frame is rooted at the `NodeKind::UvRing`
+    /// node itself. The shader dispatches `march_uv_ring` at ribbon
+    /// level 0 and the user sees the whole ring of cells from the
+    /// outside. Camera local position is mapped through the ring
+    /// topology adapter (`UvRingCellFrame::point_to_world`) so the
+    /// camera projects to its render-time ring location, not the
+    /// storage column.
     UvRing { dims: [u32; 3], slab_depth: u8 },
+    /// **Inside-cell view**: render frame is rooted at the cell
+    /// content node (the `TangentBlock` head at the slab leaf).
+    /// `render_path` traverses the slab so `cell_x` is recoverable
+    /// from the path. The shader dispatches `march_cartesian` on the
+    /// cell content directly. Camera local position is in the cell's
+    /// own `[0, 3)³` (after the TB head's `R^T`).
+    UvRingCell { dims: [u32; 3], slab_depth: u8, cell_x: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -69,20 +79,16 @@ pub fn compute_render_frame(
     target.truncate(desired_depth);
     let mut node_id = world_root;
     let mut reached = Path::root();
-    let mut kind = match library.get(world_root).map(|n| n.kind) {
-        Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
-            ActiveFrameKind::WrappedPlane { dims, slab_depth }
-        }
-        Some(NodeKind::UvRing { dims, slab_depth }) => {
-            ActiveFrameKind::UvRing { dims, slab_depth }
-        }
-        _ => ActiveFrameKind::Cartesian,
-    };
+    let mut kind = active_frame_kind_for_node(library, node_id);
     for k in 0..target.depth() as usize {
-        if matches!(
-            kind,
-            ActiveFrameKind::WrappedPlane { .. } | ActiveFrameKind::UvRing { .. },
-        ) {
+        // `WrappedPlane` is the only kind whose render frame must
+        // BE the WP node itself (the shader dispatches at frame
+        // depth 0). `UvRing` allows descent: when the anchor walks
+        // through the storage slab into a cell's content, the
+        // render frame lands at the cell content (`Cartesian` /
+        // `TangentBlock` head) and the surrounding `App` layer
+        // promotes the kind to `UvRingCell` based on the slab path.
+        if matches!(kind, ActiveFrameKind::WrappedPlane { .. }) {
             break;
         }
         let Some(node) = library.get(node_id) else { break };
@@ -91,19 +97,7 @@ pub fn compute_render_frame(
             Child::Node(child_id) => {
                 reached.push(slot as u8);
                 node_id = child_id;
-                if let Some(child_node) = library.get(child_id) {
-                    match child_node.kind {
-                        NodeKind::WrappedPlane { dims, slab_depth } => {
-                            kind = ActiveFrameKind::WrappedPlane { dims, slab_depth };
-                            break;
-                        }
-                        NodeKind::UvRing { dims, slab_depth } => {
-                            kind = ActiveFrameKind::UvRing { dims, slab_depth };
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
+                kind = active_frame_kind_for_node(library, child_id);
             }
             Child::Block(_) | Child::Empty | Child::EntityRef(_) => break,
         }
@@ -113,6 +107,19 @@ pub fn compute_render_frame(
         logical_path: reached,
         node_id,
         kind,
+    }
+}
+
+#[inline]
+fn active_frame_kind_for_node(library: &NodeLibrary, node_id: NodeId) -> ActiveFrameKind {
+    match library.get(node_id).map(|n| n.kind) {
+        Some(NodeKind::WrappedPlane { dims, slab_depth }) => {
+            ActiveFrameKind::WrappedPlane { dims, slab_depth }
+        }
+        Some(NodeKind::UvRing { dims, slab_depth }) => {
+            ActiveFrameKind::UvRing { dims, slab_depth }
+        }
+        _ => ActiveFrameKind::Cartesian,
     }
 }
 

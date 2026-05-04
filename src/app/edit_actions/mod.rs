@@ -106,19 +106,15 @@ impl App {
                 );
                 (hit, frame_path)
             }
-            ActiveFrameKind::Cartesian => {
+            // Cartesian and UvRingCell both run the standard
+            // Cartesian DDA on the frame's content. UvRingCell's
+            // `render_path` traverses the slab so the frame root is
+            // the cell content (TB head); from inside, the world
+            // looks like a normal Cartesian cube and the existing
+            // `cpu_raycast_in_frame` machinery handles it.
+            ActiveFrameKind::Cartesian | ActiveFrameKind::UvRingCell { .. } => {
                 let frame_path = self.active_frame.render_path;
-                // Rotation-aware projection: when the anchor crosses
-                // a TangentBlock the offset lives in the chain-rotated
-                // (and inscribed-shrunk) frame, so plain `in_frame`
-                // would compute the wrong cam_local for OOB offsets.
-                // `in_frame_rot` accounts for `R^T·/tb_scale` per TB
-                // on the path — agrees with what `gpu_camera_for_frame`
-                // already does (`in_frame_rot` at line 624 of mod.rs)
-                // so cursor targeting matches what the shader renders.
-                let cam_local = self.camera.position.in_frame_rot(
-                    &self.world.library, self.world.root, &frame_path,
-                );
+                let cam_local = self.camera_local_for_active_frame(&self.active_frame);
                 let ray_dir = self.ray_dir_in_frame(&frame_path);
                 let hit = raycast::cpu_raycast_in_frame(
                     &self.world.library,

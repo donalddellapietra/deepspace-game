@@ -61,7 +61,8 @@ impl App {
         let cam_local = match frame.kind {
             ActiveFrameKind::Cartesian
             | ActiveFrameKind::WrappedPlane { .. }
-            | ActiveFrameKind::UvRing { .. } => {
+            | ActiveFrameKind::UvRing { .. }
+            | ActiveFrameKind::UvRingCell { .. } => {
                 self.camera.position.in_frame(&frame.render_path)
             }
         };
@@ -77,7 +78,8 @@ impl App {
         let (cam_local, frame_center_local, frame_span) = match frame.kind {
             ActiveFrameKind::Cartesian
             | ActiveFrameKind::WrappedPlane { .. }
-            | ActiveFrameKind::UvRing { .. } => (
+            | ActiveFrameKind::UvRing { .. }
+            | ActiveFrameKind::UvRingCell { .. } => (
                 self.camera.position.in_frame(&frame.render_path),
                 [1.5, 1.5, 1.5],
                 crate::world::anchor::WORLD_SIZE,
@@ -128,7 +130,8 @@ impl App {
             let cam_local = match frame.kind {
                 ActiveFrameKind::Cartesian
             | ActiveFrameKind::WrappedPlane { .. }
-            | ActiveFrameKind::UvRing { .. } => {
+            | ActiveFrameKind::UvRing { .. }
+            | ActiveFrameKind::UvRingCell { .. } => {
                     self.camera.position.in_frame(&frame.render_path)
                 }
             };
