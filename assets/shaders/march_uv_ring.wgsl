@@ -1,38 +1,8 @@
-fn uv_ring_angle_in_cell(angle: f32, cell_x: i32, angle_step: f32) -> bool {
-    let pi = 3.14159265;
-    let lo = -pi + f32(cell_x) * angle_step;
-    let hi = lo + angle_step;
-    return angle >= lo - 1e-5 && angle <= hi + 1e-5;
-}
-
-fn uv_ring_point_in_cell(
-    p: vec3<f32>,
-    center: vec3<f32>,
-    radius: f32,
-    half_side: f32,
-    cell_x: i32,
-    angle_step: f32,
-) -> bool {
-    let d = p - center;
-    let rho = length(d.xz);
-    let angle = atan2(d.z, d.x);
-    return rho >= radius - half_side - 1e-5
-        && rho <= radius + half_side + 1e-5
-        && d.y >= -half_side - 1e-5
-        && d.y <= half_side + 1e-5
-        && uv_ring_angle_in_cell(angle, cell_x, angle_step);
-}
-
-fn uv_ring_first_cylinder_t(
-    oc: vec3<f32>,
-    dir: vec3<f32>,
-    cyl_radius: f32,
-    after: f32,
-) -> f32 {
+fn ring_radius_after(oc: vec3<f32>, dir: vec3<f32>, radius: f32, after: f32) -> f32 {
     let a = dir.x * dir.x + dir.z * dir.z;
     if a < 1e-12 { return -1.0; }
     let b = 2.0 * (oc.x * dir.x + oc.z * dir.z);
-    let c = oc.x * oc.x + oc.z * oc.z - cyl_radius * cyl_radius;
+    let c = oc.x * oc.x + oc.z * oc.z - radius * radius;
     let disc = b * b - 4.0 * a * c;
     if disc < 0.0 { return -1.0; }
     let sq = sqrt(disc);
@@ -46,34 +16,7 @@ fn uv_ring_first_cylinder_t(
     return -1.0;
 }
 
-fn uv_ring_second_cylinder_t(
-    oc: vec3<f32>,
-    dir: vec3<f32>,
-    cyl_radius: f32,
-    after: f32,
-) -> f32 {
-    let a = dir.x * dir.x + dir.z * dir.z;
-    if a < 1e-12 { return -1.0; }
-    let b = 2.0 * (oc.x * dir.x + oc.z * dir.z);
-    let c = oc.x * oc.x + oc.z * oc.z - cyl_radius * cyl_radius;
-    let disc = b * b - 4.0 * a * c;
-    if disc < 0.0 { return -1.0; }
-    let sq = sqrt(disc);
-    let inv_2a = 0.5 / a;
-    let t0 = (-b - sq) * inv_2a;
-    let t1 = (-b + sq) * inv_2a;
-    let t_lo = min(t0, t1);
-    let t_hi = max(t0, t1);
-    if t_lo > after && t_hi > after { return t_hi; }
-    return -1.0;
-}
-
-fn uv_ring_meridian_t(
-    oc: vec3<f32>,
-    dir: vec3<f32>,
-    angle: f32,
-    after: f32,
-) -> f32 {
+fn ring_meridian_after(oc: vec3<f32>, dir: vec3<f32>, angle: f32, after: f32) -> f32 {
     let n = vec3<f32>(-sin(angle), 0.0, cos(angle));
     let denom = dot(dir, n);
     if abs(denom) < 1e-12 { return -1.0; }
@@ -82,123 +25,137 @@ fn uv_ring_meridian_t(
     return -1.0;
 }
 
-fn uv_ring_surface_normal(
-    p: vec3<f32>,
-    center: vec3<f32>,
-    uv_min: vec3<f32>,
-    uv_step: vec3<f32>,
-) -> vec3<f32> {
-    let d = p - center;
-    let rho = max(length(d.xz), 1e-6);
-    let radial = vec3<f32>(d.x / rho, 0.0, d.z / rho);
-    let lo = uv_min.x;
-    let hi = uv_min.x + uv_step.x;
-    let angle = atan2(d.z, d.x);
-    let dist_inner = abs(rho - uv_min.y);
-    let dist_outer = abs(rho - (uv_min.y + uv_step.y));
-    let dist_y_lo = abs(p.y - uv_min.z);
-    let dist_y_hi = abs(p.y - (uv_min.z + uv_step.z));
-    let dist_lo = abs(angle - lo) * rho;
-    let dist_hi = abs(angle - hi) * rho;
-
-    var best = dist_outer;
-    var n = radial;
-    if dist_inner < best { best = dist_inner; n = -radial; }
-    if dist_y_hi < best { best = dist_y_hi; n = vec3<f32>(0.0, 1.0, 0.0); }
-    if dist_y_lo < best { best = dist_y_lo; n = vec3<f32>(0.0, -1.0, 0.0); }
-    if dist_lo < best { best = dist_lo; n = normalize(vec3<f32>(sin(lo), 0.0, -cos(lo))); }
-    if dist_hi < best { n = normalize(vec3<f32>(-sin(hi), 0.0, cos(hi))); }
-    return n;
+fn ring_y_after(ray_origin: vec3<f32>, ray_dir: vec3<f32>, y: f32, after: f32) -> f32 {
+    if abs(ray_dir.y) < 1e-12 { return -1.0; }
+    let t = (y - ray_origin.y) / ray_dir.y;
+    if t > after { return t; }
+    return -1.0;
 }
 
-fn uv_ring_point_in_bounds(
-    p: vec3<f32>,
-    center: vec3<f32>,
-    uv_min: vec3<f32>,
-    uv_step: vec3<f32>,
-) -> bool {
-    let d = p - center;
-    let rho = length(d.xz);
-    let angle = atan2(d.z, d.x);
-    return angle >= uv_min.x - 1e-5
-        && angle <= uv_min.x + uv_step.x + 1e-5
-        && rho >= uv_min.y - 1e-5
-        && rho <= uv_min.y + uv_step.y + 1e-5
-        && p.y >= uv_min.z - 1e-5
-        && p.y <= uv_min.z + uv_step.z + 1e-5;
-}
-
-fn uv_ring_next_boundary_t(
-    oc: vec3<f32>,
-    dir: vec3<f32>,
-    center: vec3<f32>,
-    uv_min: vec3<f32>,
-    uv_step: vec3<f32>,
-    after: f32,
-) -> f32 {
-    var t_next = 1e20;
-    let eps = 1e-5;
-    let t_a0 = uv_ring_meridian_t(oc, dir, uv_min.x, after);
-    if t_a0 > 0.0 && t_a0 < t_next {
-        let p = center + oc + dir * max(t_a0 - eps, after);
-        if uv_ring_point_in_bounds(p, center, uv_min, uv_step) { t_next = t_a0; }
-    }
-    let t_a1 = uv_ring_meridian_t(oc, dir, uv_min.x + uv_step.x, after);
-    if t_a1 > 0.0 && t_a1 < t_next {
-        let p = center + oc + dir * max(t_a1 - eps, after);
-        if uv_ring_point_in_bounds(p, center, uv_min, uv_step) { t_next = t_a1; }
-    }
-    let t_r0 = uv_ring_first_cylinder_t(oc, dir, max(uv_min.y, 1e-5), after);
-    if t_r0 > 0.0 && t_r0 < t_next {
-        let p = center + oc + dir * max(t_r0 - eps, after);
-        if uv_ring_point_in_bounds(p, center, uv_min, uv_step) { t_next = t_r0; }
-    }
-    let t_r1 = uv_ring_second_cylinder_t(oc, dir, max(uv_min.y, 1e-5), after);
-    if t_r1 > 0.0 && t_r1 < t_next {
-        let p = center + oc + dir * max(t_r1 - eps, after);
-        if uv_ring_point_in_bounds(p, center, uv_min, uv_step) { t_next = t_r1; }
-    }
-    let t_r2 = uv_ring_first_cylinder_t(oc, dir, uv_min.y + uv_step.y, after);
-    if t_r2 > 0.0 && t_r2 < t_next {
-        let p = center + oc + dir * max(t_r2 - eps, after);
-        if uv_ring_point_in_bounds(p, center, uv_min, uv_step) { t_next = t_r2; }
-    }
-    let t_r3 = uv_ring_second_cylinder_t(oc, dir, uv_min.y + uv_step.y, after);
-    if t_r3 > 0.0 && t_r3 < t_next {
-        let p = center + oc + dir * max(t_r3 - eps, after);
-        if uv_ring_point_in_bounds(p, center, uv_min, uv_step) { t_next = t_r3; }
-    }
-    if abs(dir.y) > 1e-8 {
-        let t_y0 = (uv_min.z - center.y - oc.y) / dir.y;
-        if t_y0 > after && t_y0 < t_next {
-            let p = center + oc + dir * max(t_y0 - eps, after);
-            if uv_ring_point_in_bounds(p, center, uv_min, uv_step) { t_next = t_y0; }
-        }
-        let t_y1 = (uv_min.z + uv_step.z - center.y - oc.y) / dir.y;
-        if t_y1 > after && t_y1 < t_next {
-            let p = center + oc + dir * max(t_y1 - eps, after);
-            if uv_ring_point_in_bounds(p, center, uv_min, uv_step) { t_next = t_y1; }
-        }
-    }
-    return t_next;
-}
-
-fn uv_ring_uv_at(p: vec3<f32>, center: vec3<f32>) -> vec3<f32> {
+fn ring_coords(p: vec3<f32>, center: vec3<f32>) -> vec3<f32> {
     let d = p - center;
     return vec3<f32>(atan2(d.z, d.x), length(d.xz), p.y);
 }
 
-const UV_RING_STACK_DEPTH: u32 = 24u;
+fn ring_normal_for_cell(
+    p: vec3<f32>,
+    center: vec3<f32>,
+    theta_lo: f32, theta_hi: f32,
+    r_lo: f32, r_hi: f32,
+    y_lo: f32, y_hi: f32,
+) -> vec3<f32> {
+    let d = p - center;
+    let rho = max(length(d.xz), 1e-6);
+    let radial = vec3<f32>(d.x / rho, 0.0, d.z / rho);
+    let theta = atan2(d.z, d.x);
+    let dist_theta_lo = abs(theta - theta_lo) * rho;
+    let dist_theta_hi = abs(theta - theta_hi) * rho;
+    let dist_r_lo = abs(rho - r_lo);
+    let dist_r_hi = abs(rho - r_hi);
+    let dist_y_lo = abs(p.y - y_lo);
+    let dist_y_hi = abs(p.y - y_hi);
 
-fn march_uv_ring_subtree(
-    root_node_idx: u32,
+    var best = dist_r_hi;
+    var n = radial;
+    if dist_r_lo < best { best = dist_r_lo; n = -radial; }
+    if dist_y_hi < best { best = dist_y_hi; n = vec3<f32>(0.0, 1.0, 0.0); }
+    if dist_y_lo < best { best = dist_y_lo; n = vec3<f32>(0.0, -1.0, 0.0); }
+    if dist_theta_lo < best { best = dist_theta_lo; n = normalize(vec3<f32>(sin(theta_lo), 0.0, -cos(theta_lo))); }
+    if dist_theta_hi < best { n = normalize(vec3<f32>(-sin(theta_hi), 0.0, cos(theta_hi))); }
+    return n;
+}
+
+fn make_ring_hit(
+    pos: vec3<f32>,
+    center: vec3<f32>,
+    t_param: f32,
+    block_type: u32,
+    theta: f32, rho: f32, y: f32,
+    theta_lo: f32, theta_hi: f32,
+    r_lo: f32, r_hi: f32,
+    y_lo: f32, y_hi: f32,
+    theta_step: f32, r_step: f32, y_step: f32,
+) -> HitResult {
+    var result: HitResult;
+    let normal = ring_normal_for_cell(pos, center, theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi);
+    let theta_in = clamp((theta - theta_lo) / theta_step, 0.0, 1.0);
+    let r_in = clamp((rho - r_lo) / r_step, 0.0, 1.0);
+    let y_in = clamp((y - y_lo) / y_step, 0.0, 1.0);
+    let local = vec3<f32>(theta_in, r_in, y_in);
+    let bevel = cube_face_bevel(local, normal);
+    result.hit = true;
+    result.t = t_param;
+    result.color = palette[block_type].rgb * (0.82 + 0.18 * bevel);
+    result.normal = normal;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = pos - local;
+    result.cell_size = 1.0;
+    return result;
+}
+
+fn ring_recompute_cell(
     ray_origin: vec3<f32>,
     ray_dir: vec3<f32>,
     center: vec3<f32>,
-    uv_root_min: vec3<f32>,
-    uv_root_step: vec3<f32>,
-    t_enter: f32,
+    t: f32,
+    theta_org: f32,
+    r_org: f32,
+    y_org: f32,
+    theta_step: f32,
+    r_step: f32,
+    y_step: f32,
+) -> vec3<i32> {
+    let uv = ring_coords(ray_origin + ray_dir * t, center);
+    return vec3<i32>(
+        i32(floor((uv.x - theta_org) / theta_step)),
+        i32(floor((uv.y - r_org) / r_step)),
+        i32(floor((uv.z - y_org) / y_step)),
+    );
+}
+
+fn ring_next_cell_t(
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    oc: vec3<f32>,
+    theta_lo: f32, theta_hi: f32,
+    r_lo: f32, r_hi: f32,
+    y_lo: f32, y_hi: f32,
+    after: f32,
     t_exit: f32,
+) -> f32 {
+    var t_next = t_exit + 1.0;
+    let t_theta_lo = ring_meridian_after(oc, ray_dir, theta_lo, after);
+    if t_theta_lo > 0.0 && t_theta_lo < t_next { t_next = t_theta_lo; }
+    let t_theta_hi = ring_meridian_after(oc, ray_dir, theta_hi, after);
+    if t_theta_hi > 0.0 && t_theta_hi < t_next { t_next = t_theta_hi; }
+    let t_r_lo = ring_radius_after(oc, ray_dir, max(r_lo, 1e-5), after);
+    if t_r_lo > 0.0 && t_r_lo < t_next { t_next = t_r_lo; }
+    let t_r_hi = ring_radius_after(oc, ray_dir, r_hi, after);
+    if t_r_hi > 0.0 && t_r_hi < t_next { t_next = t_r_hi; }
+    let t_y_lo = ring_y_after(ray_origin, ray_dir, y_lo, after);
+    if t_y_lo > 0.0 && t_y_lo < t_next { t_next = t_y_lo; }
+    let t_y_hi = ring_y_after(ray_origin, ray_dir, y_hi, after);
+    if t_y_hi > 0.0 && t_y_hi < t_next { t_next = t_y_hi; }
+    return t_next;
+}
+
+const UV_RING_STACK_DEPTH: u32 = 24u;
+
+fn march_uv_ring_anchor(
+    anchor_idx: u32,
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    center: vec3<f32>,
+    oc: vec3<f32>,
+    t_in: f32,
+    t_exit: f32,
+    slab_theta_lo: f32,
+    slab_theta_step: f32,
+    slab_r_lo: f32,
+    slab_r_step: f32,
+    slab_y_lo: f32,
+    slab_y_step: f32,
 ) -> HitResult {
     var result: HitResult;
     result.hit = false;
@@ -209,47 +166,76 @@ fn march_uv_ring_subtree(
     result.cell_size = 1.0;
 
     var s_node_idx: array<u32, UV_RING_STACK_DEPTH>;
-    var s_uv_min: array<vec3<f32>, UV_RING_STACK_DEPTH>;
-    var s_uv_step: array<vec3<f32>, UV_RING_STACK_DEPTH>;
+    var s_cell: array<u32, UV_RING_STACK_DEPTH>;
     var depth: u32 = 0u;
-    s_node_idx[0] = root_node_idx;
-    s_uv_min[0] = uv_root_min;
-    s_uv_step[0] = uv_root_step;
+    s_node_idx[0] = anchor_idx;
 
-    let oc = ray_origin - center;
-    var t = max(t_enter, 0.0) + 1e-5;
-    var iterations: u32 = 0u;
+    var cur_theta_org = slab_theta_lo;
+    var cur_r_org = slab_r_lo;
+    var cur_y_org = slab_y_lo;
+    var cur_theta_step = slab_theta_step / 3.0;
+    var cur_r_step = slab_r_step / 3.0;
+    var cur_y_step = slab_y_step / 3.0;
+
+    var t = max(t_in, 0.0) + 1e-5;
+    s_cell[0] = pack_cell(clamp(
+        ring_recompute_cell(
+            ray_origin, ray_dir, center, t,
+            cur_theta_org, cur_r_org, cur_y_org,
+            cur_theta_step, cur_r_step, cur_y_step,
+        ),
+        vec3<i32>(0),
+        vec3<i32>(2),
+    ));
+
+    var iters: u32 = 0u;
     loop {
-        if iterations > 4096u || t > t_exit || depth >= UV_RING_STACK_DEPTH { break; }
-        iterations = iterations + 1u;
+        if iters > 2048u { break; }
+        iters = iters + 1u;
+        if t > t_exit { break; }
 
-        let node_min = s_uv_min[depth];
-        let node_step = s_uv_step[depth];
-        let p = ray_origin + ray_dir * t;
-        if !uv_ring_point_in_bounds(p, center, node_min, node_step) {
+        let cell = unpack_cell(s_cell[depth]);
+        if cell.x < 0 || cell.x > 2 || cell.y < 0 || cell.y > 2 || cell.z < 0 || cell.z > 2 {
             if depth == 0u { break; }
             depth = depth - 1u;
+            cur_theta_step = cur_theta_step * 3.0;
+            cur_r_step = cur_r_step * 3.0;
+            cur_y_step = cur_y_step * 3.0;
+            let popped = unpack_cell(s_cell[depth]);
+            cur_theta_org = cur_theta_org - f32(popped.x) * cur_theta_step;
+            cur_r_org = cur_r_org - f32(popped.y) * cur_r_step;
+            cur_y_org = cur_y_org - f32(popped.z) * cur_y_step;
+            s_cell[depth] = pack_cell(ring_recompute_cell(
+                ray_origin, ray_dir, center, t,
+                cur_theta_org, cur_r_org, cur_y_org,
+                cur_theta_step, cur_r_step, cur_y_step,
+            ));
             continue;
         }
 
-        let uv = uv_ring_uv_at(p, center);
-        let rel = (uv - node_min) / node_step;
-        let cell = vec3<i32>(
-            clamp(i32(floor(rel.x * 3.0)), 0, 2),
-            clamp(i32(floor(rel.y * 3.0)), 0, 2),
-            clamp(i32(floor(rel.z * 3.0)), 0, 2),
+        let theta_lo = cur_theta_org + f32(cell.x) * cur_theta_step;
+        let theta_hi = theta_lo + cur_theta_step;
+        let r_lo = cur_r_org + f32(cell.y) * cur_r_step;
+        let r_hi = r_lo + cur_r_step;
+        let y_lo = cur_y_org + f32(cell.z) * cur_y_step;
+        let y_hi = y_lo + cur_y_step;
+        let t_next = ring_next_cell_t(
+            ray_origin, ray_dir, oc,
+            theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi,
+            t, t_exit,
         );
-        let slot = u32(cell.x + cell.y * 3 + cell.z * 9);
-        let child_step = node_step / 3.0;
-        let child_min = node_min + vec3<f32>(cell) * child_step;
 
+        let slot = u32(cell.x + cell.y * 3 + cell.z * 9);
         let header_off = node_offsets[s_node_idx[depth]];
         let occ = tree[header_off];
         let bit = 1u << slot;
         if (occ & bit) == 0u {
-            let t_next = uv_ring_next_boundary_t(oc, ray_dir, center, child_min, child_step, t);
-            if t_next >= 1e19 { break; }
-            t = t_next + max(min(min(child_step.x, child_step.y), child_step.z) * 1e-4, 1e-6);
+            t = t_next + max(min(min(cur_theta_step, cur_r_step), cur_y_step) * 1e-4, 1e-6);
+            s_cell[depth] = pack_cell(ring_recompute_cell(
+                ray_origin, ray_dir, center, t,
+                cur_theta_org, cur_r_org, cur_y_org,
+                cur_theta_step, cur_r_step, cur_y_step,
+            ));
             continue;
         }
 
@@ -260,75 +246,123 @@ fn march_uv_ring_subtree(
         let tag = packed & 0xFFu;
         let block_type = (packed >> 8u) & 0xFFFFu;
 
-        if tag == 1u || depth + 1u >= UV_RING_STACK_DEPTH {
-            let hit_world = ray_origin + ray_dir * t;
-            let normal = uv_ring_surface_normal(hit_world, center, child_min, child_step);
-            let local = clamp((uv_ring_uv_at(hit_world, center) - child_min) / child_step, vec3<f32>(0.0), vec3<f32>(1.0));
-            let bevel = cube_face_bevel(local, normal);
-            result.hit = true;
-            result.t = t;
-            result.color = palette[block_type].rgb * (0.82 + 0.18 * bevel);
-            result.normal = normal;
-            result.cell_min = hit_world - local;
-            result.cell_size = 1.0;
-            return result;
+        if tag == 1u {
+            let pos_h = ray_origin + ray_dir * t;
+            let uv_h = ring_coords(pos_h, center);
+            return make_ring_hit(
+                pos_h, center, t, block_type,
+                uv_h.x, uv_h.y, uv_h.z,
+                theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi,
+                cur_theta_step, cur_r_step, cur_y_step,
+            );
         }
 
         if tag != 2u || block_type == 0xFFFEu {
-            let t_next = uv_ring_next_boundary_t(oc, ray_dir, center, child_min, child_step, t);
-            if t_next >= 1e19 { break; }
-            t = t_next + max(min(min(child_step.x, child_step.y), child_step.z) * 1e-4, 1e-6);
+            t = t_next + max(min(min(cur_theta_step, cur_r_step), cur_y_step) * 1e-4, 1e-6);
+            s_cell[depth] = pack_cell(ring_recompute_cell(
+                ray_origin, ray_dir, center, t,
+                cur_theta_org, cur_r_org, cur_y_org,
+                cur_theta_step, cur_r_step, cur_y_step,
+            ));
             continue;
         }
 
+        if depth + 1u >= UV_RING_STACK_DEPTH {
+            let pos_h = ray_origin + ray_dir * t;
+            let uv_h = ring_coords(pos_h, center);
+            return make_ring_hit(
+                pos_h, center, t, block_type,
+                uv_h.x, uv_h.y, uv_h.z,
+                theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi,
+                cur_theta_step, cur_r_step, cur_y_step,
+            );
+        }
+
+        let child_idx = tree[child_base + 1u];
         depth = depth + 1u;
-        s_node_idx[depth] = tree[child_base + 1u];
-        s_uv_min[depth] = child_min;
-        s_uv_step[depth] = child_step;
-        t = t + max(min(min(child_step.x, child_step.y), child_step.z) * 1e-5, 1e-7);
+        s_node_idx[depth] = child_idx;
+        cur_theta_org = theta_lo;
+        cur_r_org = r_lo;
+        cur_y_org = y_lo;
+        cur_theta_step = cur_theta_step / 3.0;
+        cur_r_step = cur_r_step / 3.0;
+        cur_y_step = cur_y_step / 3.0;
+        s_cell[depth] = pack_cell(clamp(
+            ring_recompute_cell(
+                ray_origin, ray_dir, center, t,
+                cur_theta_org, cur_r_org, cur_y_org,
+                cur_theta_step, cur_r_step, cur_y_step,
+            ),
+            vec3<i32>(0),
+            vec3<i32>(2),
+        ));
     }
 
     return result;
 }
 
-fn uv_ring_cell_local(
+fn ring_point_in_top_cell(
     p: vec3<f32>,
     center: vec3<f32>,
-    radius: f32,
-    side: f32,
-    cell_x: i32,
-    angle_step: f32,
-) -> vec3<f32> {
-    let pi = 3.14159265;
-    let d = p - center;
-    let rho = length(d.xz);
-    let angle = atan2(d.z, d.x);
-    let cell_center_angle = -pi + (f32(cell_x) + 0.5) * angle_step;
-    return vec3<f32>(
-        ((angle - cell_center_angle) / angle_step) * 3.0 + 1.5,
-        ((rho - radius) / side) * 3.0 + 1.5,
-        (d.y / side) * 3.0 + 1.5,
-    );
+    theta_lo: f32,
+    theta_hi: f32,
+    r_lo: f32,
+    r_hi: f32,
+    y_lo: f32,
+    y_hi: f32,
+) -> bool {
+    let uv = ring_coords(p, center);
+    return uv.x >= theta_lo - 1e-5 && uv.x <= theta_hi + 1e-5
+        && uv.y >= r_lo - 1e-5 && uv.y <= r_hi + 1e-5
+        && uv.z >= y_lo - 1e-5 && uv.z <= y_hi + 1e-5;
 }
 
-fn uv_ring_consider_t(
-    candidate_t: f32,
-    cell_x: i32,
-    center: vec3<f32>,
-    radius: f32,
-    half_side: f32,
-    angle_step: f32,
+fn ring_top_entry_t(
     ray_origin: vec3<f32>,
     ray_dir: vec3<f32>,
-    best_t: ptr<function, f32>,
-) {
-    if candidate_t < 0.0 || candidate_t >= (*best_t) {
-        return;
+    center: vec3<f32>,
+    theta_lo: f32,
+    theta_hi: f32,
+    r_lo: f32,
+    r_hi: f32,
+    y_lo: f32,
+    y_hi: f32,
+) -> f32 {
+    if ring_point_in_top_cell(ray_origin, center, theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi) {
+        return 0.0;
     }
-    let probe = ray_origin + ray_dir * (candidate_t + 1e-5);
-    if uv_ring_point_in_cell(probe, center, radius, half_side, cell_x, angle_step) {
-        *best_t = candidate_t;
+    let oc = ray_origin - center;
+    var best = 1e20;
+    let candidates = vec4<f32>(
+        ring_meridian_after(oc, ray_dir, theta_lo, -1e-5),
+        ring_meridian_after(oc, ray_dir, theta_hi, -1e-5),
+        ring_radius_after(oc, ray_dir, r_lo, -1e-5),
+        ring_radius_after(oc, ray_dir, r_hi, -1e-5),
+    );
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        let t = candidates[i];
+        if t >= 0.0 && t < best {
+            let p = ray_origin + ray_dir * (t + 1e-5);
+            if ring_point_in_top_cell(p, center, theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi) {
+                best = t;
+            }
+        }
     }
+    let ty0 = ring_y_after(ray_origin, ray_dir, y_lo, -1e-5);
+    if ty0 >= 0.0 && ty0 < best {
+        let p = ray_origin + ray_dir * (ty0 + 1e-5);
+        if ring_point_in_top_cell(p, center, theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi) {
+            best = ty0;
+        }
+    }
+    let ty1 = ring_y_after(ray_origin, ray_dir, y_hi, -1e-5);
+    if ty1 >= 0.0 && ty1 < best {
+        let p = ray_origin + ray_dir * (ty1 + 1e-5);
+        if ring_point_in_top_cell(p, center, theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi) {
+            best = ty1;
+        }
+    }
+    return best;
 }
 
 fn march_uv_ring(
@@ -352,84 +386,57 @@ fn march_uv_ring(
 
     let center = body_origin + vec3<f32>(body_size * 0.5);
     let pi = 3.14159265;
-    let angle_step = 2.0 * pi / f32(dims_x);
+    let theta_step = 2.0 * pi / f32(dims_x);
     let radius = body_size * 0.38;
     let side = max((2.0 * pi * radius / f32(dims_x)) * 0.95, body_size / 27.0);
     let half_side = side * 0.5;
+    let r_lo = radius - half_side;
+    let r_hi = radius + half_side;
+    let y_lo = center.y - half_side;
+    let y_hi = center.y + half_side;
     let oc = ray_origin - center;
 
     var best_t = 1e20;
-    var best: HitResult = result;
+    var best = result;
     for (var cell_x: i32 = 0; cell_x < dims_x; cell_x = cell_x + 1) {
+        let theta_lo = -pi + f32(cell_x) * theta_step;
+        let theta_hi = theta_lo + theta_step;
         let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, 0);
-        if sample.block_type == 0xFFFEu {
+        if sample.block_type == 0xFFFEu { continue; }
+
+        let cell_t = ring_top_entry_t(
+            ray_origin, ray_dir_in, center,
+            theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi,
+        );
+        if cell_t >= best_t || cell_t >= 1e19 { continue; }
+
+        if sample.tag == 2u {
+            let sub = march_uv_ring_anchor(
+                sample.child_idx,
+                ray_origin, ray_dir_in, center, oc,
+                cell_t,
+                best_t,
+                theta_lo, theta_step,
+                r_lo, side,
+                y_lo, side,
+            );
+            if sub.hit && sub.t < best_t {
+                best_t = sub.t;
+                best = sub;
+            }
             continue;
         }
 
-        let lo = -pi + f32(cell_x) * angle_step;
-        let hi = lo + angle_step;
-        var cell_t = 1e20;
-
-        if uv_ring_point_in_cell(ray_origin, center, radius, half_side, cell_x, angle_step) {
-            cell_t = 0.0;
-        }
-
-        let t_outer0 = uv_ring_first_cylinder_t(oc, ray_dir_in, radius + half_side, -1e-5);
-        uv_ring_consider_t(t_outer0, cell_x, center, radius, half_side, angle_step, ray_origin, ray_dir_in, &cell_t);
-        let t_outer1 = uv_ring_second_cylinder_t(oc, ray_dir_in, radius + half_side, -1e-5);
-        uv_ring_consider_t(t_outer1, cell_x, center, radius, half_side, angle_step, ray_origin, ray_dir_in, &cell_t);
-        let inner_radius = max(radius - half_side, 1e-5);
-        let t_inner0 = uv_ring_first_cylinder_t(oc, ray_dir_in, inner_radius, -1e-5);
-        uv_ring_consider_t(t_inner0, cell_x, center, radius, half_side, angle_step, ray_origin, ray_dir_in, &cell_t);
-        let t_inner1 = uv_ring_second_cylinder_t(oc, ray_dir_in, inner_radius, -1e-5);
-        uv_ring_consider_t(t_inner1, cell_x, center, radius, half_side, angle_step, ray_origin, ray_dir_in, &cell_t);
-
-        if abs(ray_dir_in.y) > 1e-8 {
-            let t_y_lo = ((center.y - half_side) - ray_origin.y) / ray_dir_in.y;
-            uv_ring_consider_t(t_y_lo, cell_x, center, radius, half_side, angle_step, ray_origin, ray_dir_in, &cell_t);
-            let t_y_hi = ((center.y + half_side) - ray_origin.y) / ray_dir_in.y;
-            uv_ring_consider_t(t_y_hi, cell_x, center, radius, half_side, angle_step, ray_origin, ray_dir_in, &cell_t);
-        }
-
-        let t_lo = uv_ring_meridian_t(oc, ray_dir_in, lo, -1e-5);
-        uv_ring_consider_t(t_lo, cell_x, center, radius, half_side, angle_step, ray_origin, ray_dir_in, &cell_t);
-        let t_hi = uv_ring_meridian_t(oc, ray_dir_in, hi, -1e-5);
-        uv_ring_consider_t(t_hi, cell_x, center, radius, half_side, angle_step, ray_origin, ray_dir_in, &cell_t);
-
-        if cell_t < best_t {
-            let cell_uv_min = vec3<f32>(lo, radius - half_side, center.y - half_side);
-            let cell_uv_step = vec3<f32>(angle_step, side, side);
-            if sample.tag == 2u {
-                let sub = march_uv_ring_subtree(
-                    sample.child_idx, ray_origin, ray_dir_in, center,
-                    cell_uv_min, cell_uv_step, cell_t, 1e20,
-                );
-                if sub.hit && sub.t < best_t {
-                    best_t = sub.t;
-                    best = sub;
-                }
-                continue;
-            }
-
-            let hit_world = ray_origin + ray_dir_in * cell_t;
-            let normal = uv_ring_surface_normal(hit_world, center, cell_uv_min, cell_uv_step);
-            let local_in_cell = clamp(
-                uv_ring_cell_local(hit_world, center, radius, side, cell_x, angle_step) / 3.0,
-                vec3<f32>(0.0), vec3<f32>(1.0),
-            );
-            let bevel = cube_face_bevel(local_in_cell, normal);
-            var out: HitResult;
-            out.hit = true;
-            out.t = cell_t;
-            out.color = palette[sample.block_type].rgb * (0.82 + 0.18 * bevel);
-            out.normal = normal;
-            out.frame_level = 0u;
-            out.frame_scale = 1.0;
-            out.cell_min = hit_world - local_in_cell;
-            out.cell_size = 1.0;
-            best_t = cell_t;
-            best = out;
-        }
+        let pos_h = ray_origin + ray_dir_in * cell_t;
+        let uv_h = ring_coords(pos_h, center);
+        let hit = make_ring_hit(
+            pos_h, center, cell_t, sample.block_type,
+            uv_h.x, uv_h.y, uv_h.z,
+            theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi,
+            theta_step, side, side,
+        );
+        best_t = cell_t;
+        best = hit;
     }
 
     return best;
