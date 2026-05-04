@@ -173,7 +173,7 @@ impl App {
             &previous_cell_path,
         );
         let mut cell_x = previous_cell_x as i32;
-        let mut cell_y = previous_cell_y as i32;
+        let cell_y = previous_cell_y as i32;
         let mut cell_z = previous_cell_z as i32;
         while cell_local[0] < 0.0 {
             cell_local[0] += WORLD_SIZE;
@@ -182,14 +182,6 @@ impl App {
         while cell_local[0] >= WORLD_SIZE {
             cell_local[0] -= WORLD_SIZE;
             cell_x += 1;
-        }
-        while cell_local[1] < 0.0 && cell_y > 0 {
-            cell_local[1] += WORLD_SIZE;
-            cell_y -= 1;
-        }
-        while cell_local[1] >= WORLD_SIZE && cell_y + 1 < dims[1] as i32 {
-            cell_local[1] -= WORLD_SIZE;
-            cell_y += 1;
         }
         while cell_local[2] < 0.0 && cell_z > 0 {
             cell_local[2] += WORLD_SIZE;
@@ -565,23 +557,19 @@ mod tests {
     }
 
     #[test]
-    fn two_layer_radial_exit_can_enter_neighbor_shell() {
+    fn radial_exit_keeps_boundary_shell_with_outside_local_y() {
         let dims = [27, 2, 2];
         let slab_depth = 3;
-        let mut cell_local = [1.5, WORLD_SIZE + 0.25, 1.5];
-        let mut cell_y = 0i32;
-        while cell_local[1] >= WORLD_SIZE && cell_y + 1 < dims[1] as i32 {
-            cell_local[1] -= WORLD_SIZE;
-            cell_y += 1;
-        }
         let pos = world_pos_from_frame_local_unclamped(
-            &uv_ring_cell_path(13, cell_y as u32, 0, slab_depth),
-            cell_local,
+            &uv_ring_cell_path(13, 0, 0, slab_depth),
+            [1.5, WORLD_SIZE + 0.25, 1.5],
             5,
         );
         assert_eq!(
             uv_ring_cell_coords_from_path(&pos.anchor, dims, slab_depth),
-            Some((13, 1, 0)),
+            Some((13, 0, 0)),
         );
+        let local = pos.in_frame(&uv_ring_cell_path(13, 0, 0, slab_depth));
+        assert!(local[1] > WORLD_SIZE, "local should remain outside radial shell: {local:?}");
     }
 }
