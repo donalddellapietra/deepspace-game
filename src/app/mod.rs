@@ -686,8 +686,8 @@ impl App {
 
     pub(super) fn camera_local_for_active_frame(&self, frame: &ActiveFrame) -> [f32; 3] {
         match frame.kind {
-            ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x, cell_z } => {
-                let _ = (dims, slab_depth, cell_x, cell_z);
+            ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x, cell_y, cell_z } => {
+                let _ = (dims, slab_depth, cell_x, cell_y, cell_z);
                 self.camera.position.in_frame_rot(
                     &self.world.library,
                     self.world.root,
@@ -695,16 +695,16 @@ impl App {
                 )
             }
             ActiveFrameKind::UvRing { dims, slab_depth } => {
-                if let Some((cell_x, cell_z)) =
+                if let Some((cell_x, cell_y, cell_z)) =
                     uv_ring_cell_coords_from_path(&self.camera.position.anchor, dims, slab_depth)
                 {
-                    let cell_path = uv_ring_cell_path(cell_x, cell_z, slab_depth);
+                    let cell_path = uv_ring_cell_path(cell_x, cell_y, cell_z, slab_depth);
                     let cell_local = self.camera.position.in_frame_rot(
                         &self.world.library,
                         self.world.root,
                         &cell_path,
                     );
-                    uv_ring_cell_frame_at_local_x(dims, slab_depth, cell_x, cell_z, cell_local[0])
+                    uv_ring_cell_frame_at_local_x(dims, slab_depth, cell_x, cell_y, cell_z, cell_local[0])
                         .point_to_ring_world(cell_local)
                 } else {
                     self.camera.position.in_frame_rot(
@@ -729,9 +729,9 @@ impl App {
         dir_world: [f32; 3],
     ) -> [f32; 3] {
         match frame.kind {
-            ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x, cell_z } => {
+            ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x, cell_y, cell_z } => {
                 let cell_dir = self
-                    .continuous_uv_ring_cell_frame(dims, slab_depth, cell_x, cell_z)
+                    .continuous_uv_ring_cell_frame(dims, slab_depth, cell_x, cell_y, cell_z)
                     .dir_to_local(dir_world);
                 let stick_root_dir = uv_ring_cell_dir_to_stick_root(dims, cell_dir);
                 cartesian_dir_in_path(stick_root_dir, &frame.render_path)
@@ -782,14 +782,15 @@ impl App {
         else {
             return (rot, scale);
         };
-        let Some((cell_x, cell_z)) =
+        let Some((cell_x, cell_y, cell_z)) =
             uv_ring_cell_coords_from_path(&self.camera.position.anchor, dims, slab_depth)
         else {
             return (rot, scale);
         };
 
-        let centered = uv_ring_cell_frame(dims, slab_depth, cell_x, cell_z);
-        let continuous = self.continuous_uv_ring_cell_frame(dims, slab_depth, cell_x, cell_z);
+        let centered = uv_ring_cell_frame(dims, slab_depth, cell_x, cell_y, cell_z);
+        let continuous =
+            self.continuous_uv_ring_cell_frame(dims, slab_depth, cell_x, cell_y, cell_z);
         let centered_rot = [centered.tangent, centered.radial, centered.up];
         let continuous_rot = [continuous.tangent, continuous.radial, continuous.up];
         let centered_rot_t = [
@@ -853,8 +854,10 @@ pub(super) fn frame_path_chain(
     let mut rot = IDENTITY_ROTATION;
     let mut scale: f32 = 1.0;
     if let Some(NodeKind::UvRing { dims, slab_depth }) = library.get(world_root).map(|n| n.kind) {
-        if let Some((cell_x, cell_z)) = uv_ring_cell_coords_from_path(frame_path, dims, slab_depth) {
-            let f = uv_ring_cell_frame(dims, slab_depth, cell_x, cell_z);
+        if let Some((cell_x, cell_y, cell_z)) =
+            uv_ring_cell_coords_from_path(frame_path, dims, slab_depth)
+        {
+            let f = uv_ring_cell_frame(dims, slab_depth, cell_x, cell_y, cell_z);
             rot = [f.tangent, f.radial, f.up];
         }
     }
@@ -891,8 +894,10 @@ pub(super) fn frame_path_rotation(
     use crate::world::tree::{Child, IDENTITY_ROTATION, NodeKind};
     let mut rot = IDENTITY_ROTATION;
     if let Some(NodeKind::UvRing { dims, slab_depth }) = library.get(world_root).map(|n| n.kind) {
-        if let Some((cell_x, cell_z)) = uv_ring_cell_coords_from_path(frame_path, dims, slab_depth) {
-            let f = uv_ring_cell_frame(dims, slab_depth, cell_x, cell_z);
+        if let Some((cell_x, cell_y, cell_z)) =
+            uv_ring_cell_coords_from_path(frame_path, dims, slab_depth)
+        {
+            let f = uv_ring_cell_frame(dims, slab_depth, cell_x, cell_y, cell_z);
             rot = [f.tangent, f.radial, f.up];
         }
     }

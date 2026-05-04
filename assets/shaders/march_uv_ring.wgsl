@@ -455,6 +455,7 @@ fn march_uv_ring(
     result.cell_size = 1.0;
 
     let dims_x = i32(uniforms.slab_dims.x);
+    let dims_y = i32(max(uniforms.slab_dims.y, 1u));
     let dims_z = i32(max(uniforms.slab_dims.z, 1u));
     let slab_depth = uniforms.slab_dims.w;
     if dims_x <= 0 { return result; }
@@ -464,9 +465,9 @@ fn march_uv_ring(
     let theta_step = 2.0 * pi / f32(dims_x);
     let radius = body_size * 0.38;
     let side = max((2.0 * pi * radius / f32(dims_x)) * 0.95, body_size / 27.0);
-    let half_side = side * 0.5;
-    let r_lo = radius - half_side;
-    let r_hi = radius + half_side;
+    let shell_width = side * f32(dims_y);
+    let r_lo = radius - shell_width * 0.5;
+    let r_hi = radius + shell_width * 0.5;
     let height = side * f32(dims_z);
     let y_lo = center.y - height * 0.5;
     let y_hi = center.y + height * 0.5;
@@ -493,17 +494,21 @@ fn march_uv_ring(
         }
 
         let cell_x = ring_top_cell_x(probe, center, dims_x, theta_step);
+        let rho = length((probe - center).xz);
+        let cell_y = clamp(i32(floor((rho - r_lo) / side)), 0, dims_y - 1);
         let cell_z = clamp(i32(floor((probe.y - y_lo) / side)), 0, dims_z - 1);
         let theta_lo = -pi + f32(cell_x) * theta_step;
         let theta_hi = theta_lo + theta_step;
+        let cell_r_lo = r_lo + f32(cell_y) * side;
+        let cell_r_hi = cell_r_lo + side;
         let cell_y_lo = y_lo + f32(cell_z) * side;
         let cell_y_hi = cell_y_lo + side;
         let t_next = ring_next_cell_t(
             ray_origin, ray_dir_in, oc,
-            theta_lo, theta_hi, r_lo, r_hi, cell_y_lo, cell_y_hi,
+            theta_lo, theta_hi, cell_r_lo, cell_r_hi, cell_y_lo, cell_y_hi,
             probe_t, 1e20,
         );
-        let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, cell_z);
+        let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, cell_y, cell_z);
 
         if sample.tag == 2u {
             let sub = march_uv_ring_anchor(
@@ -512,7 +517,7 @@ fn march_uv_ring(
                 probe_t,
                 t_next,
                 theta_lo, theta_step,
-                r_lo, side,
+                cell_r_lo, side,
                 cell_y_lo, side,
             );
             if sub.hit { return sub; }
@@ -522,7 +527,7 @@ fn march_uv_ring(
             return make_ring_hit(
                 pos_h, center, probe_t, sample.block_type,
                 uv_h.x, uv_h.y, uv_h.z,
-                theta_lo, theta_hi, r_lo, r_hi, cell_y_lo, cell_y_hi,
+                theta_lo, theta_hi, cell_r_lo, cell_r_hi, cell_y_lo, cell_y_hi,
                 theta_step, side, side,
             );
         }

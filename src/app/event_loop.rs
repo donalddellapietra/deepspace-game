@@ -413,8 +413,8 @@ impl App {
                 crate::app::ActiveFrameKind::UvRing { dims, slab_depth } => {
                     format!("UvRing(dims={dims:?}, slab_d={slab_depth})")
                 }
-                crate::app::ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x, cell_z } => {
-                    format!("UvRingCell(dims={dims:?}, slab_d={slab_depth}, x={cell_x}, z={cell_z})")
+                crate::app::ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x, cell_y, cell_z } => {
+                    format!("UvRingCell(dims={dims:?}, slab_d={slab_depth}, x={cell_x}, y={cell_y}, z={cell_z})")
                 }
             };
             let render_path_csv = self

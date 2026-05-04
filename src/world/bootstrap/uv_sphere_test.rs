@@ -2,7 +2,7 @@
 //!
 //! Diagnostic UV ring world.
 //!
-//! Content is stored as a straight `[27, 1, 2]` UV lattice under a
+//! Content is stored as a straight `[27, 2, 2]` UV lattice under a
 //! `UvRing` root. The render path maps those rows into a cylinder, so
 //! placement and tangent rotation come from the same UV coordinate
 //! instead of rounded Cartesian sphere samples.
@@ -18,7 +18,7 @@ use crate::world::tree::{
 const GRID_DEPTH: u8 = super::DEFAULT_WRAPPED_PLANET_SLAB_DEPTH;
 const GRID_SIZE: usize = 27;
 const CELL_SUBTREE_DEPTH: u8 = 20;
-const RING_DIMS: [u32; 3] = [super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 1, 2];
+const RING_DIMS: [u32; 3] = [super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 2, 2];
 
 #[inline]
 #[cfg(test)]
@@ -100,12 +100,21 @@ pub(super) fn uv_sphere_test_world() -> WorldState {
     debug_assert_eq!(GRID_SIZE, 3usize.pow(GRID_DEPTH as u32));
     let mut library = NodeLibrary::default();
     let mut leaves = vec![Child::Empty; GRID_SIZE * GRID_SIZE * GRID_SIZE];
-    let tangent_content =
+    let grass_content =
         build_uniform_cartesian_subtree(&mut library, block::GRASS, CELL_SUBTREE_DEPTH);
+    let stone_content =
+        build_uniform_cartesian_subtree(&mut library, block::STONE, CELL_SUBTREE_DEPTH);
     for z in 0..RING_DIMS[2] as usize {
-        for x in 0..RING_DIMS[0] as usize {
-            let idx = grid_index(x, 0, z);
-            leaves[idx] = tangent_content;
+        for y in 0..RING_DIMS[1] as usize {
+            let content = if y == 0 {
+                grass_content
+            } else {
+                stone_content
+            };
+            for x in 0..RING_DIMS[0] as usize {
+                let idx = grid_index(x, y, z);
+                leaves[idx] = content;
+            }
         }
     }
 
@@ -177,10 +186,10 @@ mod tests {
     }
 
     #[test]
-    fn ring_lattice_is_two_rows_tall() {
+    fn ring_lattice_is_two_by_two() {
         assert_eq!(
             RING_DIMS,
-            [super::super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 1, 2]
+            [super::super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 2, 2]
         );
     }
 
@@ -214,20 +223,52 @@ mod tests {
     fn ring_rows_are_populated_in_uv_lattice() {
         let world = uv_sphere_test_world();
         for z in 0..RING_DIMS[2] as usize {
-            for x in 0..RING_DIMS[0] as usize {
-                let mut node_id = world.root;
-                for level in (0..GRID_DEPTH as u32).rev() {
-                    let div = 3usize.pow(level);
-                    let sx = (x / div) % 3;
-                    let sz = (z / div) % 3;
-                    let slot = slot_index(sx, 0, sz);
-                    let node = world.library.get(node_id).expect("node exists");
-                    match node.children[slot] {
-                        Child::Node(child) => node_id = child,
-                        other => panic!("ring x={x} z={z} missing at slot {slot}: {other:?}"),
+            for y in 0..RING_DIMS[1] as usize {
+                for x in 0..RING_DIMS[0] as usize {
+                    let mut node_id = world.root;
+                    for level in (0..GRID_DEPTH as u32).rev() {
+                        let div = 3usize.pow(level);
+                        let sx = (x / div) % 3;
+                        let sy = (y / div) % 3;
+                        let sz = (z / div) % 3;
+                        let slot = slot_index(sx, sy, sz);
+                        let node = world.library.get(node_id).expect("node exists");
+                        match node.children[slot] {
+                            Child::Node(child) => node_id = child,
+                            other => {
+                                panic!("ring x={x} y={y} z={z} missing at slot {slot}: {other:?}")
+                            }
+                        }
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn ring_radial_layers_have_distinct_blocks() {
+        let world = uv_sphere_test_world();
+        for (y, expected_block) in [(0usize, block::GRASS), (1usize, block::STONE)] {
+            let mut node_id = world.root;
+            for level in (0..GRID_DEPTH as u32).rev() {
+                let div = 3usize.pow(level);
+                let slot = slot_index(0, (y / div) % 3, 0);
+                let node = world.library.get(node_id).expect("node exists");
+                match node.children[slot] {
+                    Child::Node(child) => node_id = child,
+                    other => panic!("ring y={y} missing at slot {slot}: {other:?}"),
+                }
+            }
+
+            let mut child = Child::Node(node_id);
+            for _ in 0..CELL_SUBTREE_DEPTH {
+                let Child::Node(id) = child else {
+                    panic!("ring y={y} content ended early: {child:?}");
+                };
+                let node = world.library.get(id).expect("content node exists");
+                child = node.children[0];
+            }
+            assert_eq!(child, Child::Block(expected_block), "wrong block for y={y}");
         }
     }
 
@@ -259,8 +300,9 @@ mod tests {
             Child::Node(world.root),
             &mut std::collections::HashSet::new(),
         );
+        let expected_shared_content_nodes = 2 * CELL_SUBTREE_DEPTH as usize;
         assert!(
-            world.library.len() < RING_DIMS[0] as usize + CELL_SUBTREE_DEPTH as usize + 10,
+            world.library.len() < RING_DIMS[0] as usize + expected_shared_content_nodes + 10,
             "ring content should stay deduped: library={} reachable_nodes={nodes}",
             world.library.len(),
         );

@@ -10,7 +10,7 @@ const EPS: f32 = 1e-5;
 #[derive(Debug, Clone, Copy)]
 struct RingGeom {
     center: [f32; 3],
-    radius: f32,
+    radial_lo: f32,
     side: f32,
     angle_step: f32,
     height_lo: f32,
@@ -139,6 +139,7 @@ pub fn cpu_raycast_uv_ring(
 
 fn ring_geom(dims: [u32; 3]) -> RingGeom {
     let dims_x = dims[0].max(1) as f32;
+    let dims_y = dims[1].max(1) as f32;
     let dims_z = dims[2].max(1) as f32;
     let radius = BODY_SIZE * 0.38;
     let side = ((2.0 * std::f32::consts::PI * radius / dims_x) * 0.95).max(BODY_SIZE / 27.0);
@@ -146,7 +147,7 @@ fn ring_geom(dims: [u32; 3]) -> RingGeom {
     let height = side * dims_z;
     RingGeom {
         center: BODY_CENTER,
-        radius,
+        radial_lo: radius - side * dims_y * 0.5,
         side,
         angle_step,
         height_lo: BODY_CENTER[1] - height * 0.5,
@@ -154,7 +155,7 @@ fn ring_geom(dims: [u32; 3]) -> RingGeom {
 }
 
 fn ring_cell(geom: &RingGeom, cell_x: i32, cell_y: i32, cell_z: i32) -> RingCell {
-    let radial_lo = geom.radius - geom.side * 0.5 + cell_y as f32 * geom.side;
+    let radial_lo = geom.radial_lo + cell_y as f32 * geom.side;
     let height_lo = geom.height_lo + cell_z as f32 * geom.side;
     let theta_lo = -std::f32::consts::PI + cell_x as f32 * geom.angle_step;
     let theta_mid = theta_lo + geom.angle_step * 0.5;
@@ -502,6 +503,29 @@ mod tests {
             hit.path[2].1,
             slot_index(1, 0, 1),
             "slab leaf must select UV cell x=13, y=0, z=1",
+        );
+    }
+
+    #[test]
+    fn ray_to_outer_radial_shell_hits_outer_uv_cell() {
+        let dims = [27, 2, 2];
+        let (library, root) = ring_world(dims);
+        let geom = ring_geom(dims);
+        let hit = cpu_raycast_uv_ring(
+            &library,
+            root,
+            &[],
+            [3.0, 1.5 + geom.side * 0.25, 1.5],
+            [-1.0, 0.0, 0.0],
+            dims,
+            3,
+            5,
+        )
+        .expect("ray toward outer radial shell must hit");
+        assert_eq!(
+            hit.path[2].1,
+            slot_index(1, 1, 1),
+            "slab leaf must select UV cell x=13, y=1, z=1",
         );
     }
 
