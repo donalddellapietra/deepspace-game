@@ -10,9 +10,6 @@ impl App {
         if dims[0] == 0 || dims[1] != 1 || dims[2] != 1 {
             return None;
         }
-        if desired_depth < slab_depth {
-            return None;
-        }
         let cell_x = uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth)?;
         let cell_path = uv_ring_cell_path(cell_x, slab_depth);
         let cell_local = self.camera.position.in_frame_rot(
@@ -24,7 +21,7 @@ impl App {
             return None;
         }
         let mut logical_path = self.camera.position.anchor;
-        logical_path.truncate(desired_depth);
+        logical_path.truncate(desired_depth.max(slab_depth));
         let logical_path = if logical_path.depth() < slab_depth {
             uv_ring_cell_path(cell_x, slab_depth)
         } else {

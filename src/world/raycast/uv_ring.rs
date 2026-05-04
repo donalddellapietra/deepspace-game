@@ -11,7 +11,7 @@ pub fn cpu_raycast_uv_ring(
     ray_dir: [f32; 3],
     dims: [u32; 3],
     slab_depth: u8,
-    max_depth: u32,
+    _max_depth: u32,
 ) -> Option<HitInfo> {
     let mut frame_chain: Vec<(NodeId, usize)> = Vec::with_capacity(frame_path.len());
     let mut cur = world_root;
@@ -75,58 +75,19 @@ pub fn cpu_raycast_uv_ring(
             continue;
         }
 
-        let angle = -std::f32::consts::PI + (cell_x as f32 + 0.5) * angle_step;
-        let (sa, ca) = angle.sin_cos();
-        let radial = [ca, 0.0, sa];
-        let tangent = [-sa, 0.0, ca];
-        let up = [0.0, 1.0, 0.0];
-        let cube_origin = [
-            body_center[0] + radial[0] * radius,
-            body_center[1],
-            body_center[2] + radial[2] * radius,
-        ];
-        let scale = 3.0 / side;
-        let d_origin = [
-            cam_local[0] - cube_origin[0],
-            cam_local[1] - cube_origin[1],
-            cam_local[2] - cube_origin[2],
-        ];
-        let local_origin = [
-            dot(tangent, d_origin) * scale + 1.5,
-            dot(radial, d_origin) * scale + 1.5,
-            dot(up, d_origin) * scale + 1.5,
-        ];
-        let local_dir = [
-            dot(tangent, ray_dir) * scale,
-            dot(radial, ray_dir) * scale,
-            dot(up, ray_dir) * scale,
-        ];
-
-        let candidate = if let Some(anchor_id) = anchor {
-            let absolute_slab_depth = frame_path.len() as u32 + slab_depth as u32;
-            let cube_max_depth = max_depth.saturating_sub(absolute_slab_depth).max(1);
-            super::cartesian::cpu_raycast_inner(
-                library,
-                anchor_id,
-                local_origin,
-                local_dir,
-                cube_max_depth,
+        let candidate = if anchor.is_some() || uniform_block {
+            curved_cell_hit(
+                body_center,
+                radius,
+                side,
+                angle_step,
+                cell_x,
+                cam_local,
+                ray_dir,
             )
-            .map(|sub| {
-                for &(parent, slot) in &sub.path {
-                    path.push((parent, slot));
-                }
-                HitInfo {
-                    path,
-                    face: sub.face,
-                    t: sub.t,
-                    place_path: None,
-                }
-            })
-        } else if uniform_block {
-            cube_aabb_hit(local_origin, local_dir).map(|t| HitInfo {
+            .map(|(t, face)| HitInfo {
                 path,
-                face: 2,
+                face,
                 t,
                 place_path: None,
             })
@@ -149,33 +110,165 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn cube_aabb_hit(origin: [f32; 3], dir: [f32; 3]) -> Option<f32> {
-    let inv = [
-        if dir[0].abs() > 1e-8 { 1.0 / dir[0] } else { 1e10 },
-        if dir[1].abs() > 1e-8 { 1.0 / dir[1] } else { 1e10 },
-        if dir[2].abs() > 1e-8 { 1.0 / dir[2] } else { 1e10 },
+fn curved_cell_hit(
+    center: [f32; 3],
+    radius: f32,
+    side: f32,
+    angle_step: f32,
+    cell_x: i32,
+    origin: [f32; 3],
+    dir: [f32; 3],
+) -> Option<(f32, u32)> {
+    let half_side = side * 0.5;
+    let oc = [
+        origin[0] - center[0],
+        origin[1] - center[1],
+        origin[2] - center[2],
     ];
-    let t1 = [
-        (0.0 - origin[0]) * inv[0],
-        (0.0 - origin[1]) * inv[1],
-        (0.0 - origin[2]) * inv[2],
-    ];
-    let t2 = [
-        (3.0 - origin[0]) * inv[0],
-        (3.0 - origin[1]) * inv[1],
-        (3.0 - origin[2]) * inv[2],
-    ];
-    let t_enter = t1[0].min(t2[0])
-        .max(t1[1].min(t2[1]))
-        .max(t1[2].min(t2[2]));
-    let t_exit = t1[0].max(t2[0])
-        .min(t1[1].max(t2[1]))
-        .min(t1[2].max(t2[2]));
-    if t_enter < t_exit && t_exit > 0.0 {
-        Some(t_enter.max(0.0))
-    } else {
-        None
+    let mut best = f32::INFINITY;
+    consider_curved_t(
+        0.0, center, radius, half_side, angle_step, cell_x, origin, dir, &mut best,
+    );
+
+    for r in [radius + half_side, (radius - half_side).max(1e-5)] {
+        let roots = cylinder_roots_y(oc, dir, r);
+        for t in roots.into_iter().flatten() {
+            consider_curved_t(
+                t, center, radius, half_side, angle_step, cell_x, origin, dir, &mut best,
+            );
+        }
     }
+
+    if dir[1].abs() > 1e-8 {
+        for y in [center[1] - half_side, center[1] + half_side] {
+            let t = (y - origin[1]) / dir[1];
+            consider_curved_t(
+                t, center, radius, half_side, angle_step, cell_x, origin, dir, &mut best,
+            );
+        }
+    }
+
+    let lo = -std::f32::consts::PI + cell_x as f32 * angle_step;
+    let hi = lo + angle_step;
+    for angle in [lo, hi] {
+        if let Some(t) = meridian_t(oc, dir, angle) {
+            consider_curved_t(
+                t, center, radius, half_side, angle_step, cell_x, origin, dir, &mut best,
+            );
+        }
+    }
+
+    best.is_finite().then(|| {
+        let p = [
+            origin[0] + dir[0] * best,
+            origin[1] + dir[1] * best,
+            origin[2] + dir[2] * best,
+        ];
+        (best, curved_face(center, radius, half_side, angle_step, cell_x, p))
+    })
+}
+
+fn consider_curved_t(
+    t: f32,
+    center: [f32; 3],
+    radius: f32,
+    half_side: f32,
+    angle_step: f32,
+    cell_x: i32,
+    origin: [f32; 3],
+    dir: [f32; 3],
+    best: &mut f32,
+) {
+    if t < -1e-5 || t >= *best {
+        return;
+    }
+    let probe_t = t.max(0.0) + 1e-5;
+    let p = [
+        origin[0] + dir[0] * probe_t,
+        origin[1] + dir[1] * probe_t,
+        origin[2] + dir[2] * probe_t,
+    ];
+    if point_in_curved_cell(center, radius, half_side, angle_step, cell_x, p) {
+        *best = t.max(0.0);
+    }
+}
+
+fn point_in_curved_cell(
+    center: [f32; 3],
+    radius: f32,
+    half_side: f32,
+    angle_step: f32,
+    cell_x: i32,
+    p: [f32; 3],
+) -> bool {
+    let dx = p[0] - center[0];
+    let dy = p[1] - center[1];
+    let dz = p[2] - center[2];
+    let rho = (dx * dx + dz * dz).sqrt();
+    let angle = dz.atan2(dx);
+    let lo = -std::f32::consts::PI + cell_x as f32 * angle_step;
+    let hi = lo + angle_step;
+    rho >= radius - half_side - 1e-5
+        && rho <= radius + half_side + 1e-5
+        && dy >= -half_side - 1e-5
+        && dy <= half_side + 1e-5
+        && angle >= lo - 1e-5
+        && angle <= hi + 1e-5
+}
+
+fn cylinder_roots_y(oc: [f32; 3], dir: [f32; 3], radius: f32) -> [Option<f32>; 2] {
+    let a = dir[0] * dir[0] + dir[2] * dir[2];
+    if a < 1e-12 {
+        return [None, None];
+    }
+    let b = 2.0 * (oc[0] * dir[0] + oc[2] * dir[2]);
+    let c = oc[0] * oc[0] + oc[2] * oc[2] - radius * radius;
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return [None, None];
+    }
+    let sq = disc.sqrt();
+    let inv_2a = 0.5 / a;
+    [Some((-b - sq) * inv_2a), Some((-b + sq) * inv_2a)]
+}
+
+fn meridian_t(oc: [f32; 3], dir: [f32; 3], angle: f32) -> Option<f32> {
+    let n = [-angle.sin(), 0.0, angle.cos()];
+    let denom = dot(dir, n);
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    Some(-dot(oc, n) / denom)
+}
+
+fn curved_face(
+    center: [f32; 3],
+    radius: f32,
+    half_side: f32,
+    angle_step: f32,
+    cell_x: i32,
+    p: [f32; 3],
+) -> u32 {
+    let dx = p[0] - center[0];
+    let dy = p[1] - center[1];
+    let dz = p[2] - center[2];
+    let rho = (dx * dx + dz * dz).sqrt();
+    let angle = dz.atan2(dx);
+    let lo = -std::f32::consts::PI + cell_x as f32 * angle_step;
+    let hi = lo + angle_step;
+    let candidates = [
+        ((rho - (radius + half_side)).abs(), if dx >= 0.0 { 0 } else { 1 }),
+        ((rho - (radius - half_side)).abs(), if dx >= 0.0 { 1 } else { 0 }),
+        ((dy - half_side).abs(), 2),
+        ((dy + half_side).abs(), 3),
+        ((angle - lo).abs() * radius, 5),
+        ((angle - hi).abs() * radius, 4),
+    ];
+    candidates
+        .into_iter()
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, face)| face)
+        .unwrap_or(2)
 }
 
 #[cfg(test)]

@@ -613,6 +613,9 @@ impl App {
 
     pub(super) fn zoom_anchor(&mut self, step: i32) {
         if step == 0 { return; }
+        if step > 0 {
+            self.ensure_uv_ring_camera_anchor_local();
+        }
         let cur = self.anchor_depth() as i32;
         let max_depth = crate::world::tree::MAX_DEPTH as i32;
         let new_depth = (cur + step).clamp(1, max_depth);
