@@ -17,7 +17,7 @@ use crate::world::tree::MAX_DEPTH;
 
 use self::uv_ring::{
     cartesian_dir_in_path, uv_ring_cell_dir_to_stick_root, uv_ring_cell_frame,
-    uv_ring_cell_path, uv_ring_cell_x_from_path,
+    uv_ring_cell_frame_at_local_x, uv_ring_cell_path, uv_ring_cell_x_from_path,
 };
 
 /// `render_margin` passed to `with_render_margin`. For Cartesian
@@ -578,11 +578,7 @@ impl App {
                 // `renormalize_world` then handles cell-boundary
                 // crossings (including TB rotation pivots) cell-locally.
                 let step_world = [delta[0] * scale, delta[1] * scale, delta[2] * scale];
-                let (anchor_rot, anchor_scale) = frame_path_chain(
-                    &self.world.library,
-                    self.world.root,
-                    &self.camera.position.anchor,
-                );
+                let (anchor_rot, anchor_scale) = self.camera_anchor_path_chain();
                 let rotated = crate::world::mat3::transpose_mul_vec3(&anchor_rot, &step_world);
                 let inv_scale = if anchor_scale > 1e-6 { 1.0 / anchor_scale } else { 1.0 };
                 let step_local = [
@@ -708,7 +704,8 @@ impl App {
                         self.world.root,
                         &cell_path,
                     );
-                    uv_ring_cell_frame(dims, slab_depth, cell_x).point_to_world(cell_local)
+                    uv_ring_cell_frame_at_local_x(dims, slab_depth, cell_x, cell_local[0])
+                        .point_to_ring_world(cell_local)
                 } else {
                     self.camera.position.in_frame_rot(
                         &self.world.library,
@@ -733,7 +730,8 @@ impl App {
     ) -> [f32; 3] {
         match frame.kind {
             ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x } => {
-                let cell_dir = uv_ring_cell_frame(dims, slab_depth, cell_x)
+                let cell_dir = self
+                    .continuous_uv_ring_cell_frame(dims, slab_depth, cell_x)
                     .dir_to_local(dir_world);
                 let stick_root_dir = uv_ring_cell_dir_to_stick_root(dims, cell_dir);
                 cartesian_dir_in_path(stick_root_dir, &frame.render_path)
@@ -769,6 +767,38 @@ impl App {
             crate::world::sdf::normalize(right),
             crate::world::sdf::normalize(up),
         )
+    }
+
+    fn camera_anchor_path_chain(&self) -> ([[f32; 3]; 3], f32) {
+        use crate::world::tree::NodeKind;
+
+        let (mut rot, scale) = frame_path_chain(
+            &self.world.library,
+            self.world.root,
+            &self.camera.position.anchor,
+        );
+        let Some(NodeKind::UvRing { dims, slab_depth }) =
+            self.world.library.get(self.world.root).map(|n| n.kind)
+        else {
+            return (rot, scale);
+        };
+        let Some(cell_x) = uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth)
+        else {
+            return (rot, scale);
+        };
+
+        let centered = uv_ring_cell_frame(dims, slab_depth, cell_x);
+        let continuous = self.continuous_uv_ring_cell_frame(dims, slab_depth, cell_x);
+        let centered_rot = [centered.tangent, centered.radial, centered.up];
+        let continuous_rot = [continuous.tangent, continuous.radial, continuous.up];
+        let centered_rot_t = [
+            [centered_rot[0][0], centered_rot[1][0], centered_rot[2][0]],
+            [centered_rot[0][1], centered_rot[1][1], centered_rot[2][1]],
+            [centered_rot[0][2], centered_rot[1][2], centered_rot[2][2]],
+        ];
+        let correction = crate::world::mat3::matmul(&continuous_rot, &centered_rot_t);
+        rot = crate::world::mat3::matmul(&correction, &rot);
+        (rot, scale)
     }
 }
 

@@ -157,6 +157,21 @@ impl App {
         );
         uv_ring_cell_frame(dims, slab_depth, cell_x).point_to_local(root_cam)
     }
+
+    pub(super) fn continuous_uv_ring_cell_frame(
+        &self,
+        dims: [u32; 3],
+        slab_depth: u8,
+        cell_x: u32,
+    ) -> UvRingCellFrame {
+        let cell_path = uv_ring_cell_path(cell_x, slab_depth);
+        let cell_local = self.camera.position.in_frame_rot(
+            &self.world.library,
+            self.world.root,
+            &cell_path,
+        );
+        uv_ring_cell_frame_at_local_x(dims, slab_depth, cell_x, cell_local[0])
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -186,25 +201,13 @@ impl UvRingCellFrame {
         ]
     }
 
-    pub(super) fn point_to_world(self, p: [f32; 3]) -> [f32; 3] {
-        let q = [
-            (p[0] - 1.5) / self.scale,
-            (p[1] - 1.5) / self.scale,
-            (p[2] - 1.5) / self.scale,
-        ];
+    pub(super) fn point_to_ring_world(self, p: [f32; 3]) -> [f32; 3] {
+        let radial_offset = (p[1] - 1.5) / self.scale;
+        let up_offset = (p[2] - 1.5) / self.scale;
         [
-            self.origin[0]
-                + self.tangent[0] * q[0]
-                + self.radial[0] * q[1]
-                + self.up[0] * q[2],
-            self.origin[1]
-                + self.tangent[1] * q[0]
-                + self.radial[1] * q[1]
-                + self.up[1] * q[2],
-            self.origin[2]
-                + self.tangent[2] * q[0]
-                + self.radial[2] * q[1]
-                + self.up[2] * q[2],
+            self.origin[0] + self.radial[0] * radial_offset + self.up[0] * up_offset,
+            self.origin[1] + self.radial[1] * radial_offset + self.up[1] * up_offset,
+            self.origin[2] + self.radial[2] * radial_offset + self.up[2] * up_offset,
         ]
     }
 }
@@ -214,13 +217,29 @@ pub(super) fn uv_ring_cell_frame(
     _slab_depth: u8,
     cell_x: u32,
 ) -> UvRingCellFrame {
+    let angle_step = 2.0 * std::f32::consts::PI / dims[0] as f32;
+    let angle = -std::f32::consts::PI + (cell_x as f32 + 0.5) * angle_step;
+    uv_ring_cell_frame_at_angle(dims, angle)
+}
+
+pub(super) fn uv_ring_cell_frame_at_local_x(
+    dims: [u32; 3],
+    _slab_depth: u8,
+    cell_x: u32,
+    local_x: f32,
+) -> UvRingCellFrame {
+    let angle_step = 2.0 * std::f32::consts::PI / dims[0] as f32;
+    let cell_center_angle = -std::f32::consts::PI + (cell_x as f32 + 0.5) * angle_step;
+    let angle = cell_center_angle + ((local_x - 1.5) / WORLD_SIZE) * angle_step;
+    uv_ring_cell_frame_at_angle(dims, angle)
+}
+
+fn uv_ring_cell_frame_at_angle(dims: [u32; 3], angle: f32) -> UvRingCellFrame {
     let body_size = 3.0_f32;
     let center = [body_size * 0.5; 3];
     let radius = body_size * 0.38;
-    let angle_step = 2.0 * std::f32::consts::PI / dims[0] as f32;
     let side = ((2.0 * std::f32::consts::PI * radius / dims[0] as f32) * 0.95)
         .max(body_size / 27.0);
-    let angle = -std::f32::consts::PI + (cell_x as f32 + 0.5) * angle_step;
     let (sa, ca) = angle.sin_cos();
     let radial = [ca, 0.0, sa];
     let tangent = [-sa, 0.0, ca];
@@ -317,4 +336,39 @@ fn uv_ring_cell_local_is_near_ring_slab(p: [f32; 3], slab_depth: u8) -> bool {
         && (-1.5..4.5).contains(&p[0])
         && (-entry_margin..(3.0 + entry_margin)).contains(&p[1])
         && (-entry_margin..(3.0 + entry_margin)).contains(&p[2])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_vec3_close(a: [f32; 3], b: [f32; 3]) {
+        for i in 0..3 {
+            assert!((a[i] - b[i]).abs() < 1e-5, "{a:?} != {b:?}");
+        }
+    }
+
+    #[test]
+    fn continuous_cell_frame_matches_at_shared_ring_boundary() {
+        let dims = [27, 1, 1];
+        let slab_depth = 3;
+        let left_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 20, 0.0);
+        let right_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 19, WORLD_SIZE);
+
+        assert_vec3_close(left_cell.tangent, right_cell.tangent);
+        assert_vec3_close(left_cell.radial, right_cell.radial);
+        assert_vec3_close(left_cell.up, right_cell.up);
+    }
+
+    #[test]
+    fn curved_ring_position_matches_at_shared_ring_boundary() {
+        let dims = [27, 1, 1];
+        let slab_depth = 3;
+        let left_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 20, 0.0);
+        let right_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 19, WORLD_SIZE);
+        let left = left_cell.point_to_ring_world([0.0, 1.48, 2.91]);
+        let right = right_cell.point_to_ring_world([WORLD_SIZE, 1.48, 2.91]);
+
+        assert_vec3_close(left, right);
+    }
 }
