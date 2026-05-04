@@ -7,28 +7,33 @@ impl App {
         let crate::world::tree::NodeKind::UvRing { dims, slab_depth } = root.kind else {
             return None;
         };
-        if dims[0] == 0 || dims[1] != 1 || dims[2] != 1 {
+        if dims[0] == 0 || dims[1] != 1 || dims[2] == 0 {
             return None;
         }
-        let cell_x = uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth)?;
-        let cell_path = uv_ring_cell_path(cell_x, slab_depth);
-        let cell_local = self.camera.position.in_frame_rot(
-            &self.world.library,
-            self.world.root,
-            &cell_path,
-        );
+        let (cell_x, cell_z) =
+            uv_ring_cell_coords_from_path(&self.camera.position.anchor, dims, slab_depth)?;
+        let cell_path = uv_ring_cell_path(cell_x, cell_z, slab_depth);
+        let cell_local =
+            self.camera
+                .position
+                .in_frame_rot(&self.world.library, self.world.root, &cell_path);
         if !uv_ring_cell_local_is_near_ring_slab(cell_local, slab_depth) {
             return None;
         }
         let mut logical_path = self.camera.position.anchor;
         logical_path.truncate(desired_depth.max(slab_depth));
         let logical_path = if logical_path.depth() < slab_depth {
-            uv_ring_cell_path(cell_x, slab_depth)
+            uv_ring_cell_path(cell_x, cell_z, slab_depth)
         } else {
             logical_path
         };
         let mut render_path = logical_path;
-        render_path.truncate(render_path.depth().saturating_sub(RENDER_FRAME_CONTEXT).max(slab_depth));
+        render_path.truncate(
+            render_path
+                .depth()
+                .saturating_sub(RENDER_FRAME_CONTEXT)
+                .max(slab_depth),
+        );
         let render = frame::compute_render_frame(
             &self.world.library,
             self.world.root,
@@ -39,7 +44,12 @@ impl App {
             render_path,
             logical_path,
             node_id: render.node_id,
-            kind: ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x },
+            kind: ActiveFrameKind::UvRingCell {
+                dims,
+                slab_depth,
+                cell_x,
+                cell_z,
+            },
         })
     }
 
@@ -57,20 +67,33 @@ impl App {
     }
 
     fn nearest_uv_ring_cell_x(&self, dims: [u32; 3]) -> u32 {
-        let root_cam = self.camera.position.in_frame_rot(
-            &self.world.library,
-            self.world.root,
-            &Path::root(),
-        );
+        let root_cam =
+            self.camera
+                .position
+                .in_frame_rot(&self.world.library, self.world.root, &Path::root());
         let dx = root_cam[0] - 1.5;
         let dz = root_cam[2] - 1.5;
-        let mut u = (dz.atan2(dx) + std::f32::consts::PI)
-            / (2.0 * std::f32::consts::PI);
+        let mut u = (dz.atan2(dx) + std::f32::consts::PI) / (2.0 * std::f32::consts::PI);
         if !u.is_finite() {
             u = 0.0;
         }
         let cell = (u * dims[0] as f32).floor() as i32;
         cell.rem_euclid(dims[0] as i32) as u32
+    }
+
+    fn nearest_uv_ring_cell_z(&self, dims: [u32; 3]) -> Option<u32> {
+        let root_cam =
+            self.camera
+                .position
+                .in_frame_rot(&self.world.library, self.world.root, &Path::root());
+        let side = uv_ring_cell_side(dims);
+        let height = side * dims[2].max(1) as f32;
+        let height_lo = 1.5 - height * 0.5;
+        let cell_f = (root_cam[1] - height_lo) / side;
+        if !(0.0..dims[2].max(1) as f32).contains(&cell_f) {
+            return None;
+        }
+        Some(cell_f.floor() as u32)
     }
 
     pub(super) fn ensure_uv_ring_camera_anchor_local(&mut self) {
@@ -80,19 +103,22 @@ impl App {
         let crate::world::tree::NodeKind::UvRing { dims, slab_depth } = root.kind else {
             return;
         };
-        if dims[0] == 0 || dims[1] != 1 || dims[2] != 1 {
+        if dims[0] == 0 || dims[1] != 1 || dims[2] == 0 {
             return;
         }
-        if uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth).is_some() {
+        if uv_ring_cell_coords_from_path(&self.camera.position.anchor, dims, slab_depth).is_some() {
             return;
         }
         let cell_x = self.nearest_uv_ring_cell_x(dims);
-        let cell_local = self.camera_root_to_uv_ring_cell_local(dims, slab_depth, cell_x);
+        let Some(cell_z) = self.nearest_uv_ring_cell_z(dims) else {
+            return;
+        };
+        let cell_local = self.camera_root_to_uv_ring_cell_local(dims, slab_depth, cell_x, cell_z);
         if !uv_ring_cell_local_is_near_ring_slab(cell_local, slab_depth) {
             return;
         }
         self.camera.position = world_pos_from_frame_local_unclamped(
-            &uv_ring_cell_path(cell_x, slab_depth),
+            &uv_ring_cell_path(cell_x, cell_z, slab_depth),
             cell_local,
             self.camera.position.anchor.depth(),
         );
@@ -105,25 +131,26 @@ impl App {
         let crate::world::tree::NodeKind::UvRing { dims, slab_depth } = root.kind else {
             return;
         };
-        if dims[0] == 0 || dims[1] != 1 || dims[2] != 1 {
+        if dims[0] == 0 || dims[1] != 1 || dims[2] == 0 {
             return;
         }
-        let Some(previous_cell_x) =
-            uv_ring_cell_x_from_path(&previous_position.anchor, slab_depth)
+        let Some((previous_cell_x, previous_cell_z)) =
+            uv_ring_cell_coords_from_path(&previous_position.anchor, dims, slab_depth)
         else {
             return;
         };
-        if uv_ring_cell_x_from_path(&self.camera.position.anchor, slab_depth).is_some() {
+        if uv_ring_cell_coords_from_path(&self.camera.position.anchor, dims, slab_depth).is_some() {
             return;
         }
 
-        let previous_cell_path = uv_ring_cell_path(previous_cell_x, slab_depth);
+        let previous_cell_path = uv_ring_cell_path(previous_cell_x, previous_cell_z, slab_depth);
         let mut cell_local = self.camera.position.in_frame_rot(
             &self.world.library,
             self.world.root,
             &previous_cell_path,
         );
         let mut cell_x = previous_cell_x as i32;
+        let mut cell_z = previous_cell_z as i32;
         while cell_local[0] < 0.0 {
             cell_local[0] += WORLD_SIZE;
             cell_x -= 1;
@@ -132,9 +159,21 @@ impl App {
             cell_local[0] -= WORLD_SIZE;
             cell_x += 1;
         }
+        while cell_local[2] < 0.0 {
+            cell_local[2] += WORLD_SIZE;
+            cell_z -= 1;
+        }
+        while cell_local[2] >= WORLD_SIZE {
+            cell_local[2] -= WORLD_SIZE;
+            cell_z += 1;
+        }
+        if !(0..dims[2] as i32).contains(&cell_z) {
+            return;
+        }
         let cell_x = cell_x.rem_euclid(dims[0] as i32) as u32;
+        let cell_z = cell_z as u32;
         self.camera.position = world_pos_from_frame_local_unclamped(
-            &uv_ring_cell_path(cell_x, slab_depth),
+            &uv_ring_cell_path(cell_x, cell_z, slab_depth),
             cell_local,
             self.camera.position.anchor.depth(),
         );
@@ -145,14 +184,13 @@ impl App {
         dims: [u32; 3],
         slab_depth: u8,
         cell_x: u32,
+        cell_z: u32,
     ) -> [f32; 3] {
-        let _ = slab_depth;
-        let root_cam = self.camera.position.in_frame_rot(
-            &self.world.library,
-            self.world.root,
-            &Path::root(),
-        );
-        uv_ring_cell_frame(dims, slab_depth, cell_x).point_to_local(root_cam)
+        let root_cam =
+            self.camera
+                .position
+                .in_frame_rot(&self.world.library, self.world.root, &Path::root());
+        uv_ring_cell_frame(dims, slab_depth, cell_x, cell_z).point_to_local(root_cam)
     }
 
     pub(super) fn continuous_uv_ring_cell_frame(
@@ -160,14 +198,14 @@ impl App {
         dims: [u32; 3],
         slab_depth: u8,
         cell_x: u32,
+        cell_z: u32,
     ) -> UvRingCellFrame {
-        let cell_path = uv_ring_cell_path(cell_x, slab_depth);
-        let cell_local = self.camera.position.in_frame_rot(
-            &self.world.library,
-            self.world.root,
-            &cell_path,
-        );
-        uv_ring_cell_frame_at_local_x(dims, slab_depth, cell_x, cell_local[0])
+        let cell_path = uv_ring_cell_path(cell_x, cell_z, slab_depth);
+        let cell_local =
+            self.camera
+                .position
+                .in_frame_rot(&self.world.library, self.world.root, &cell_path);
+        uv_ring_cell_frame_at_local_x(dims, slab_depth, cell_x, cell_z, cell_local[0])
     }
 }
 
@@ -213,37 +251,41 @@ pub(super) fn uv_ring_cell_frame(
     dims: [u32; 3],
     _slab_depth: u8,
     cell_x: u32,
+    cell_z: u32,
 ) -> UvRingCellFrame {
     let angle_step = 2.0 * std::f32::consts::PI / dims[0] as f32;
     let angle = -std::f32::consts::PI + (cell_x as f32 + 0.5) * angle_step;
-    uv_ring_cell_frame_at_angle(dims, angle)
+    uv_ring_cell_frame_at_angle(dims, angle, cell_z)
 }
 
 pub(super) fn uv_ring_cell_frame_at_local_x(
     dims: [u32; 3],
     _slab_depth: u8,
     cell_x: u32,
+    cell_z: u32,
     local_x: f32,
 ) -> UvRingCellFrame {
     let angle_step = 2.0 * std::f32::consts::PI / dims[0] as f32;
     let cell_center_angle = -std::f32::consts::PI + (cell_x as f32 + 0.5) * angle_step;
     let angle = cell_center_angle + ((local_x - 1.5) / WORLD_SIZE) * angle_step;
-    uv_ring_cell_frame_at_angle(dims, angle)
+    uv_ring_cell_frame_at_angle(dims, angle, cell_z)
 }
 
-fn uv_ring_cell_frame_at_angle(dims: [u32; 3], angle: f32) -> UvRingCellFrame {
+fn uv_ring_cell_frame_at_angle(dims: [u32; 3], angle: f32, cell_z: u32) -> UvRingCellFrame {
     let body_size = 3.0_f32;
     let center = [body_size * 0.5; 3];
     let radius = body_size * 0.38;
-    let side = ((2.0 * std::f32::consts::PI * radius / dims[0] as f32) * 0.95)
-        .max(body_size / 27.0);
+    let side = uv_ring_cell_side(dims);
+    let height = side * dims[2].max(1) as f32;
+    let height_lo = center[1] - height * 0.5;
+    let y = height_lo + (cell_z as f32 + 0.5) * side;
     let (sa, ca) = angle.sin_cos();
     let radial = [ca, 0.0, sa];
     let tangent = [-sa, 0.0, ca];
     let up = [0.0, 1.0, 0.0];
     let origin = [
         center[0] + radial[0] * radius,
-        center[1],
+        y,
         center[2] + radial[2] * radius,
     ];
     UvRingCellFrame {
@@ -255,7 +297,13 @@ fn uv_ring_cell_frame_at_angle(dims: [u32; 3], angle: f32) -> UvRingCellFrame {
     }
 }
 
-pub(super) fn uv_ring_cell_path(cell_x: u32, slab_depth: u8) -> Path {
+fn uv_ring_cell_side(dims: [u32; 3]) -> f32 {
+    let body_size = 3.0_f32;
+    let radius = body_size * 0.38;
+    ((2.0 * std::f32::consts::PI * radius / dims[0].max(1) as f32) * 0.95).max(body_size / 27.0)
+}
+
+pub(super) fn uv_ring_cell_path(cell_x: u32, cell_z: u32, slab_depth: u8) -> Path {
     let mut path = Path::root();
     let mut cells_per_slot = 1u32;
     for _ in 1..slab_depth {
@@ -263,7 +311,8 @@ pub(super) fn uv_ring_cell_path(cell_x: u32, slab_depth: u8) -> Path {
     }
     for _ in 0..slab_depth {
         let sx = (cell_x / cells_per_slot) % 3;
-        let slot = crate::world::tree::slot_index(sx as usize, 0, 0) as u8;
+        let sz = (cell_z / cells_per_slot) % 3;
+        let slot = crate::world::tree::slot_index(sx as usize, 0, sz as usize) as u8;
         path.push(slot);
         cells_per_slot = (cells_per_slot / 3).max(1);
     }
@@ -307,22 +356,35 @@ fn world_pos_from_frame_local_unclamped(
 pub(super) fn uv_ring_cell_dir_to_stick_root(dims: [u32; 3], cell_dir: [f32; 3]) -> [f32; 3] {
     let cell_size = crate::world::anchor::WORLD_SIZE / dims[0] as f32;
     let scale = cell_size / crate::world::anchor::WORLD_SIZE;
-    [cell_dir[0] * scale, cell_dir[1] * scale, cell_dir[2] * scale]
+    [
+        cell_dir[0] * scale,
+        cell_dir[1] * scale,
+        cell_dir[2] * scale,
+    ]
 }
 
-pub(super) fn uv_ring_cell_x_from_path(path: &Path, slab_depth: u8) -> Option<u32> {
+pub(super) fn uv_ring_cell_coords_from_path(
+    path: &Path,
+    dims: [u32; 3],
+    slab_depth: u8,
+) -> Option<(u32, u32)> {
     if path.depth() < slab_depth {
         return None;
     }
     let mut x = 0u32;
+    let mut z = 0u32;
     for k in 0..slab_depth as usize {
         let (sx, sy, sz) = crate::world::tree::slot_coords(path.slot(k) as usize);
-        if sy != 0 || sz != 0 {
+        if sy != 0 {
             return None;
         }
         x = x * 3 + sx as u32;
+        z = z * 3 + sz as u32;
     }
-    Some(x)
+    if x >= dims[0] || z >= dims[2].max(1) {
+        return None;
+    }
+    Some((x, z))
 }
 
 fn uv_ring_cell_local_is_near_ring_slab(p: [f32; 3], slab_depth: u8) -> bool {
@@ -349,8 +411,8 @@ mod tests {
     fn continuous_cell_frame_matches_at_shared_ring_boundary() {
         let dims = [27, 1, 1];
         let slab_depth = 3;
-        let left_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 20, 0.0);
-        let right_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 19, WORLD_SIZE);
+        let left_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 20, 0, 0.0);
+        let right_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 19, 0, WORLD_SIZE);
 
         assert_vec3_close(left_cell.tangent, right_cell.tangent);
         assert_vec3_close(left_cell.radial, right_cell.radial);
@@ -361,11 +423,30 @@ mod tests {
     fn curved_ring_position_matches_at_shared_ring_boundary() {
         let dims = [27, 1, 1];
         let slab_depth = 3;
-        let left_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 20, 0.0);
-        let right_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 19, WORLD_SIZE);
+        let left_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 20, 0, 0.0);
+        let right_cell = uv_ring_cell_frame_at_local_x(dims, slab_depth, 19, 0, WORLD_SIZE);
         let left = left_cell.point_to_ring_world([0.0, 1.48, 2.91]);
         let right = right_cell.point_to_ring_world([WORLD_SIZE, 1.48, 2.91]);
 
         assert_vec3_close(left, right);
+    }
+
+    #[test]
+    fn cell_path_round_trips_x_and_z() {
+        let dims = [27, 1, 2];
+        let slab_depth = 3;
+        let path = uv_ring_cell_path(21, 1, slab_depth);
+        assert_eq!(
+            uv_ring_cell_coords_from_path(&path, dims, slab_depth),
+            Some((21, 1))
+        );
+    }
+
+    #[test]
+    fn cell_path_rejects_z_outside_ring_height() {
+        let dims = [27, 1, 2];
+        let slab_depth = 3;
+        let path = uv_ring_cell_path(21, 2, slab_depth);
+        assert_eq!(uv_ring_cell_coords_from_path(&path, dims, slab_depth), None);
     }
 }

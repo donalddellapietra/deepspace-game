@@ -455,6 +455,7 @@ fn march_uv_ring(
     result.cell_size = 1.0;
 
     let dims_x = i32(uniforms.slab_dims.x);
+    let dims_z = i32(max(uniforms.slab_dims.z, 1u));
     let slab_depth = uniforms.slab_dims.w;
     if dims_x <= 0 { return result; }
 
@@ -466,8 +467,9 @@ fn march_uv_ring(
     let half_side = side * 0.5;
     let r_lo = radius - half_side;
     let r_hi = radius + half_side;
-    let y_lo = center.y - half_side;
-    let y_hi = center.y + half_side;
+    let height = side * f32(dims_z);
+    let y_lo = center.y - height * 0.5;
+    let y_hi = center.y + height * 0.5;
     let oc = ray_origin - center;
 
     var t = ring_shell_entry_after(
@@ -491,14 +493,17 @@ fn march_uv_ring(
         }
 
         let cell_x = ring_top_cell_x(probe, center, dims_x, theta_step);
+        let cell_z = clamp(i32(floor((probe.y - y_lo) / side)), 0, dims_z - 1);
         let theta_lo = -pi + f32(cell_x) * theta_step;
         let theta_hi = theta_lo + theta_step;
+        let cell_y_lo = y_lo + f32(cell_z) * side;
+        let cell_y_hi = cell_y_lo + side;
         let t_next = ring_next_cell_t(
             ray_origin, ray_dir_in, oc,
-            theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi,
+            theta_lo, theta_hi, r_lo, r_hi, cell_y_lo, cell_y_hi,
             probe_t, 1e20,
         );
-        let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, 0);
+        let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, cell_z);
 
         if sample.tag == 2u {
             let sub = march_uv_ring_anchor(
@@ -508,7 +513,7 @@ fn march_uv_ring(
                 t_next,
                 theta_lo, theta_step,
                 r_lo, side,
-                y_lo, side,
+                cell_y_lo, side,
             );
             if sub.hit { return sub; }
         } else if sample.block_type != 0xFFFEu {
@@ -517,7 +522,7 @@ fn march_uv_ring(
             return make_ring_hit(
                 pos_h, center, probe_t, sample.block_type,
                 uv_h.x, uv_h.y, uv_h.z,
-                theta_lo, theta_hi, r_lo, r_hi, y_lo, y_hi,
+                theta_lo, theta_hi, r_lo, r_hi, cell_y_lo, cell_y_hi,
                 theta_step, side, side,
             );
         }

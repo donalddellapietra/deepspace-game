@@ -2,8 +2,8 @@
 //!
 //! Diagnostic UV ring world.
 //!
-//! Content is stored as a straight `[27, 1, 1]` UV lattice under a
-//! `UvRing` root. The render path maps that one row into a ring, so
+//! Content is stored as a straight `[27, 1, 2]` UV lattice under a
+//! `UvRing` root. The render path maps those rows into a cylinder, so
 //! placement and tangent rotation come from the same UV coordinate
 //! instead of rounded Cartesian sphere samples.
 
@@ -12,13 +12,13 @@ use crate::world::anchor::WorldPos;
 use crate::world::palette::block;
 use crate::world::state::WorldState;
 use crate::world::tree::{
-    empty_children, slot_index, uniform_children, Child, NodeKind, NodeLibrary,
+    Child, NodeKind, NodeLibrary, empty_children, slot_index, uniform_children,
 };
 
 const GRID_DEPTH: u8 = super::DEFAULT_WRAPPED_PLANET_SLAB_DEPTH;
 const GRID_SIZE: usize = 27;
 const CELL_SUBTREE_DEPTH: u8 = 20;
-const RING_DIMS: [u32; 3] = [super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 1, 1];
+const RING_DIMS: [u32; 3] = [super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 1, 2];
 
 #[inline]
 #[cfg(test)]
@@ -41,11 +41,7 @@ fn tangent_rotation_for_ring_cell(cell_x: u32) -> [[f32; 3]; 3] {
     [east, radial, north]
 }
 
-fn build_uniform_cartesian_subtree(
-    library: &mut NodeLibrary,
-    block_id: u16,
-    depth: u8,
-) -> Child {
+fn build_uniform_cartesian_subtree(library: &mut NodeLibrary, block_id: u16, depth: u8) -> Child {
     if depth == 0 {
         return Child::Block(block_id);
     }
@@ -80,12 +76,17 @@ fn build_grid_tree(library: &mut NodeLibrary, leaves: Vec<Child>, root_kind: Nod
                             }
                         }
                     }
-                    let kind = if next_size == 1 { root_kind } else { NodeKind::Cartesian };
-                    next[(z * next_size + y) * next_size + x] = if children.iter().all(|c| c.is_empty()) {
-                        Child::Empty
+                    let kind = if next_size == 1 {
+                        root_kind
                     } else {
-                        Child::Node(library.insert_with_kind(children, kind))
+                        NodeKind::Cartesian
                     };
+                    next[(z * next_size + y) * next_size + x] =
+                        if children.iter().all(|c| c.is_empty()) {
+                            Child::Empty
+                        } else {
+                            Child::Node(library.insert_with_kind(children, kind))
+                        };
                 }
             }
         }
@@ -101,15 +102,20 @@ pub(super) fn uv_sphere_test_world() -> WorldState {
     let mut leaves = vec![Child::Empty; GRID_SIZE * GRID_SIZE * GRID_SIZE];
     let tangent_content =
         build_uniform_cartesian_subtree(&mut library, block::GRASS, CELL_SUBTREE_DEPTH);
-    for x in 0..RING_DIMS[0] as usize {
-        let idx = grid_index(x, 0, 0);
-        leaves[idx] = tangent_content;
+    for z in 0..RING_DIMS[2] as usize {
+        for x in 0..RING_DIMS[0] as usize {
+            let idx = grid_index(x, 0, z);
+            leaves[idx] = tangent_content;
+        }
     }
 
     let root_child = build_grid_tree(
         &mut library,
         leaves,
-        NodeKind::UvRing { dims: RING_DIMS, slab_depth: GRID_DEPTH },
+        NodeKind::UvRing {
+            dims: RING_DIMS,
+            slab_depth: GRID_DEPTH,
+        },
     );
     let root = match root_child {
         Child::Node(id) => id,
@@ -154,7 +160,10 @@ mod tests {
     #[test]
     fn tree_has_expected_depth() {
         let world = uv_sphere_test_world();
-        assert_eq!(world.tree_depth(), GRID_DEPTH as u32 + CELL_SUBTREE_DEPTH as u32);
+        assert_eq!(
+            world.tree_depth(),
+            GRID_DEPTH as u32 + CELL_SUBTREE_DEPTH as u32
+        );
     }
 
     #[test]
@@ -168,8 +177,11 @@ mod tests {
     }
 
     #[test]
-    fn ring_lattice_matches_wrapped_plane_row() {
-        assert_eq!(RING_DIMS, [super::super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 1, 1]);
+    fn ring_lattice_is_two_rows_tall() {
+        assert_eq!(
+            RING_DIMS,
+            [super::super::DEFAULT_WRAPPED_PLANET_SLAB_DIMS[0], 1, 2]
+        );
     }
 
     #[test]
@@ -177,7 +189,11 @@ mod tests {
         for cell in 0..RING_DIMS[0] {
             let rotation = tangent_rotation_for_ring_cell(cell);
             let radial = rotation[1];
-            assert!(radial[1].abs() < 1e-6, "radial y drifted at cell {cell}: {}", radial[1]);
+            assert!(
+                radial[1].abs() < 1e-6,
+                "radial y drifted at cell {cell}: {}",
+                radial[1]
+            );
         }
     }
 
@@ -195,18 +211,21 @@ mod tests {
     }
 
     #[test]
-    fn ring_row_cells_are_populated_in_uv_lattice() {
+    fn ring_rows_are_populated_in_uv_lattice() {
         let world = uv_sphere_test_world();
-        for x in 0..RING_DIMS[0] as usize {
-            let mut node_id = world.root;
-            for level in (0..GRID_DEPTH as u32).rev() {
-                let div = 3usize.pow(level);
-                let sx = (x / div) % 3;
-                let slot = slot_index(sx, 0, 0);
-                let node = world.library.get(node_id).expect("node exists");
-                match node.children[slot] {
-                    Child::Node(child) => node_id = child,
-                    other => panic!("ring x={x} missing at slot {slot}: {other:?}"),
+        for z in 0..RING_DIMS[2] as usize {
+            for x in 0..RING_DIMS[0] as usize {
+                let mut node_id = world.root;
+                for level in (0..GRID_DEPTH as u32).rev() {
+                    let div = 3usize.pow(level);
+                    let sx = (x / div) % 3;
+                    let sz = (z / div) % 3;
+                    let slot = slot_index(sx, 0, sz);
+                    let node = world.library.get(node_id).expect("node exists");
+                    match node.children[slot] {
+                        Child::Node(child) => node_id = child,
+                        other => panic!("ring x={x} z={z} missing at slot {slot}: {other:?}"),
+                    }
                 }
             }
         }
@@ -224,8 +243,11 @@ mod tests {
             if !seen.insert(id) {
                 return 0;
             }
-            let Some(node) = library.get(id) else { return 0 };
-            1 + node.children
+            let Some(node) = library.get(id) else {
+                return 0;
+            };
+            1 + node
+                .children
                 .iter()
                 .copied()
                 .map(|c| count_nonempty_nodes(library, c, seen))
@@ -252,16 +274,27 @@ mod tests {
             child: Child,
             seen: &mut std::collections::HashSet<crate::world::tree::NodeId>,
         ) -> bool {
-            if matches!(child, Child::PlacedNode { kind: NodeKind::TangentPlane { .. }, .. }) {
+            if matches!(
+                child,
+                Child::PlacedNode {
+                    kind: NodeKind::TangentPlane { .. },
+                    ..
+                }
+            ) {
                 return true;
             }
-            let Some(id) = child.node_id() else { return false };
+            let Some(id) = child.node_id() else {
+                return false;
+            };
             if !seen.insert(id) {
                 return false;
             }
-            let Some(node) = library.get(id) else { return false };
+            let Some(node) = library.get(id) else {
+                return false;
+            };
             node.kind.is_tangent_plane()
-                || node.children
+                || node
+                    .children
                     .iter()
                     .copied()
                     .any(|c| has_tangent_plane(library, c, seen))
