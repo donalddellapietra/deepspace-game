@@ -97,6 +97,21 @@ impl App {
         // layer, not what the camera renders. See `RENDER_ANCHOR_DEPTH`.
         let frame = self.render_frame();
         let mut frame = frame;
+        // UvRing kinds opt out of the shrink loop. The camera's
+        // representation IS the cell-local frame (kept in sync
+        // by `ensure_uv_ring_camera_anchor_local` /
+        // `exit_uv_ring_cell_if_needed`); shrinking past the slab
+        // path would replace the kind with `Cartesian` (the
+        // mechanical descent kind of `compute_render_frame`),
+        // making the active frame jump from the cell's `[0, 3)³`
+        // to the UvRing root's storage coordinates and producing
+        // a visible "teleport" between adjacent ticks.
+        if matches!(
+            frame.kind,
+            ActiveFrameKind::UvRingCell { .. } | ActiveFrameKind::UvRing { .. },
+        ) {
+            return frame;
+        }
         while frame.render_path.depth() > 0
             && (!self.camera_fits_frame(&frame)
                 || self.frame_projected_pixels(&frame) < FRAME_FOCUS_MIN_PIXELS)

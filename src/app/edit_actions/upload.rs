@@ -297,11 +297,34 @@ impl App {
             &effective_path,
             effective_path.depth(),
         );
+        // `compute_render_frame` derives kind purely from the
+        // deepest reached node's `NodeKind`. For UvRing worlds
+        // that maps any path past the UvRing root to `Cartesian`
+        // — losing the `UvRingCell` semantics required for the
+        // camera projection / raycast / root_kind logic.
+        // Re-derive the kind from the path: a slab traversal is a
+        // `UvRingCell`; an empty path on a UvRing world is the
+        // overview; everything else falls back to whatever the
+        // mechanical descent produced.
+        let kind = match self.world.library.get(self.world.root).map(|n| n.kind) {
+            Some(crate::world::tree::NodeKind::UvRing { dims, slab_depth }) => {
+                if let Some(cell_x) = crate::app::uv_ring::uv_ring_cell_x_from_path(
+                    &effective_path, slab_depth,
+                ) {
+                    ActiveFrameKind::UvRingCell { dims, slab_depth, cell_x }
+                } else if effective_path.depth() == 0 {
+                    ActiveFrameKind::UvRing { dims, slab_depth }
+                } else {
+                    effective_render.kind
+                }
+            }
+            _ => effective_render.kind,
+        };
         self.active_frame = ActiveFrame {
             render_path: effective_render.render_path,
             logical_path: intended_frame.logical_path,
             node_id: effective_render.node_id,
-            kind: effective_render.kind,
+            kind,
         };
         if let Some(renderer) = &mut self.renderer {
             renderer.set_frame_root(scene_frame_bfs);
