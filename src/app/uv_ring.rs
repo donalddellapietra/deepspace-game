@@ -170,22 +170,23 @@ pub fn uv_ring_cell_x_from_path(path: &Path, slab_depth: u8) -> Option<u32> {
     Some(cell_x)
 }
 
-/// True when `cell_local` lands close enough to the cell's
-/// content `[0, 3)³` for inside-cell rendering. Camera positions
-/// far above/below the ring shouldn't trigger the cell-anchored
-/// frame — they belong to the overview view.
+/// True when `cell_local` lies inside the cell's `[0, 3)³`
+/// content extent on the radial / up axes (Y and Z). Tangent (X)
+/// is intentionally wider so motion can cross cell boundaries —
+/// `exit_uv_ring_cell_if_needed` rolls `cell_x` based on X. Radial
+/// and up bounds are TIGHT so the user can fly out of the ring
+/// band; without this the cell-anchor invariant pins the camera
+/// to the cell forever.
 ///
-/// Tangent (X) bounds are intentionally wider than the cell's
-/// `[0, 3)`: motion across cell boundaries is allowed (the wrap
-/// happens in `exit_uv_ring_cell_if_needed`). Radial (Y) and up
-/// (Z) bounds are tight — only one cell's worth of margin on
-/// either side.
-fn uv_ring_cell_local_is_near_ring_slab(p: [f32; 3]) -> bool {
-    let radial_margin = 1.0_f32;
+/// A small margin is added on Y/Z so an offset that floating-
+/// point lands at exactly `0.0` or `3.0` doesn't oscillate
+/// between in-band and out-of-band on adjacent ticks.
+fn uv_ring_cell_local_in_band(p: [f32; 3]) -> bool {
+    const MARGIN: f32 = 0.01;
     p.iter().all(|v| v.is_finite())
         && (-1.5..4.5).contains(&p[0])
-        && (-radial_margin..(3.0 + radial_margin)).contains(&p[1])
-        && (-radial_margin..(3.0 + radial_margin)).contains(&p[2])
+        && (-MARGIN..(WORLD_SIZE + MARGIN)).contains(&p[1])
+        && (-MARGIN..(WORLD_SIZE + MARGIN)).contains(&p[2])
 }
 
 /// Build a `WorldPos` from `(cell_path, cell_local)`, inflating to
@@ -246,7 +247,7 @@ impl App {
         let cell_local = self.camera.position.in_frame_rot(
             &self.world.library, self.world.root, &cell_path,
         );
-        if !uv_ring_cell_local_is_near_ring_slab(cell_local) {
+        if !uv_ring_cell_local_in_band(cell_local) {
             return None;
         }
         let mut logical_path = self.camera.position.anchor;
@@ -322,7 +323,7 @@ impl App {
         );
         let cell_frame = uv_ring_cell_frame(dims, slab_depth, cell_x);
         let cell_local = cell_frame.point_to_local(cam_in_root);
-        if !uv_ring_cell_local_is_near_ring_slab(cell_local) {
+        if !uv_ring_cell_local_in_band(cell_local) {
             return;
         }
         let cell_path = uv_ring_cell_path(cell_x, slab_depth);
@@ -357,6 +358,9 @@ impl App {
             &self.world.library, self.world.root, &prev_cell_path,
         );
         let mut cell_x = prev_cell_x as i32;
+        // Tangent (X) wraps to the neighbour cell. Radial / up
+        // axes do NOT wrap — moving "outward" radially or "up/down"
+        // means the camera has flown out of the ring band entirely.
         while cell_local[0] < 0.0 {
             cell_local[0] += WORLD_SIZE;
             cell_x -= 1;
@@ -364,6 +368,16 @@ impl App {
         while cell_local[0] >= WORLD_SIZE {
             cell_local[0] -= WORLD_SIZE;
             cell_x += 1;
+        }
+        // Radial-out gate: if Y or Z left the cell's `[0, 3)`
+        // content extent, release the cell anchor and leave the
+        // camera in its renormalized non-slab state. The next
+        // `ensure_uv_ring_camera_anchor_local` will see Y/Z out of
+        // band and not re-anchor — without this gate the unconditional
+        // re-anchor pinned the camera at the cell wall every tick
+        // (visible "wrangling" when trying to fly radially out).
+        if !uv_ring_cell_local_in_band(cell_local) {
+            return;
         }
         let cell_x = cell_x.rem_euclid(dims[0] as i32) as u32;
         let cell_path = uv_ring_cell_path(cell_x, slab_depth);
