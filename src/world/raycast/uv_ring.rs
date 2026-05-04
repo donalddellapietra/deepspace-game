@@ -28,8 +28,7 @@ pub fn cpu_raycast_uv_ring(
     let body_size = 3.0_f32;
     let radius = body_size * 0.38;
     let angle_step = 2.0 * std::f32::consts::PI / dims[0] as f32;
-    let side = ((2.0 * std::f32::consts::PI * radius / dims[0] as f32) * 0.95)
-        .max(body_size / 27.0);
+    let side = (radius * angle_step).max(body_size / 27.0);
 
     let mut best: Option<HitInfo> = None;
     for cell_x in 0..dims[0] as i32 {

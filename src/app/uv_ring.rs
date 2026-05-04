@@ -155,7 +155,7 @@ impl App {
             self.world.root,
             &Path::root(),
         );
-        uv_ring_cell_frame(dims, slab_depth, cell_x).point_to_local(root_cam)
+        uv_ring_root_to_cell_local(dims, cell_x, root_cam)
     }
 
     pub(super) fn continuous_uv_ring_cell_frame(
@@ -176,7 +176,10 @@ impl App {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct UvRingCellFrame {
-    origin: [f32; 3],
+    cell_angle: f32,
+    angle_step: f32,
+    radius: f32,
+    shell: f32,
     pub(super) tangent: [f32; 3],
     pub(super) radial: [f32; 3],
     pub(super) up: [f32; 3],
@@ -184,15 +187,6 @@ pub(super) struct UvRingCellFrame {
 }
 
 impl UvRingCellFrame {
-    fn point_to_local(self, p: [f32; 3]) -> [f32; 3] {
-        let d = crate::world::sdf::sub(p, self.origin);
-        [
-            crate::world::sdf::dot(self.tangent, d) * self.scale + 1.5,
-            crate::world::sdf::dot(self.radial, d) * self.scale + 1.5,
-            crate::world::sdf::dot(self.up, d) * self.scale + 1.5,
-        ]
-    }
-
     pub(super) fn dir_to_local(self, d: [f32; 3]) -> [f32; 3] {
         [
             crate::world::sdf::dot(self.tangent, d) * self.scale,
@@ -202,12 +196,16 @@ impl UvRingCellFrame {
     }
 
     pub(super) fn point_to_ring_world(self, p: [f32; 3]) -> [f32; 3] {
-        let radial_offset = (p[1] - 1.5) / self.scale;
-        let up_offset = (p[2] - 1.5) / self.scale;
+        let lon = self.cell_angle + ((p[0] - 1.5) / WORLD_SIZE) * self.angle_step;
+        let radius = self.radius + ((p[1] - 1.5) / WORLD_SIZE) * self.shell;
+        let lat = ((p[2] - 1.5) / WORLD_SIZE) * self.angle_step;
+        let (slat, clat) = lat.sin_cos();
+        let (slon, clon) = lon.sin_cos();
+        let center = uv_ring_center();
         [
-            self.origin[0] + self.radial[0] * radial_offset + self.up[0] * up_offset,
-            self.origin[1] + self.radial[1] * radial_offset + self.up[1] * up_offset,
-            self.origin[2] + self.radial[2] * radial_offset + self.up[2] * up_offset,
+            center[0] + radius * clat * clon,
+            center[1] + radius * slat,
+            center[2] + radius * clat * slon,
         ]
     }
 }
@@ -219,7 +217,7 @@ pub(super) fn uv_ring_cell_frame(
 ) -> UvRingCellFrame {
     let angle_step = 2.0 * std::f32::consts::PI / dims[0] as f32;
     let angle = -std::f32::consts::PI + (cell_x as f32 + 0.5) * angle_step;
-    uv_ring_cell_frame_at_angle(dims, angle)
+    uv_ring_cell_frame_at_angle(dims, angle, angle)
 }
 
 pub(super) fn uv_ring_cell_frame_at_local_x(
@@ -231,31 +229,68 @@ pub(super) fn uv_ring_cell_frame_at_local_x(
     let angle_step = 2.0 * std::f32::consts::PI / dims[0] as f32;
     let cell_center_angle = -std::f32::consts::PI + (cell_x as f32 + 0.5) * angle_step;
     let angle = cell_center_angle + ((local_x - 1.5) / WORLD_SIZE) * angle_step;
-    uv_ring_cell_frame_at_angle(dims, angle)
+    uv_ring_cell_frame_at_angle(dims, cell_center_angle, angle)
 }
 
-fn uv_ring_cell_frame_at_angle(dims: [u32; 3], angle: f32) -> UvRingCellFrame {
-    let body_size = 3.0_f32;
-    let center = [body_size * 0.5; 3];
-    let radius = body_size * 0.38;
-    let side = ((2.0 * std::f32::consts::PI * radius / dims[0] as f32) * 0.95)
-        .max(body_size / 27.0);
-    let (sa, ca) = angle.sin_cos();
+fn uv_ring_cell_frame_at_angle(dims: [u32; 3], cell_angle: f32, basis_angle: f32) -> UvRingCellFrame {
+    let angle_step = uv_ring_angle_step(dims);
+    let radius = uv_ring_radius();
+    let shell = uv_ring_shell(dims);
+    let (sa, ca) = basis_angle.sin_cos();
     let radial = [ca, 0.0, sa];
     let tangent = [-sa, 0.0, ca];
     let up = [0.0, 1.0, 0.0];
-    let origin = [
-        center[0] + radial[0] * radius,
-        center[1],
-        center[2] + radial[2] * radius,
-    ];
     UvRingCellFrame {
-        origin,
+        cell_angle,
+        angle_step,
+        radius,
+        shell,
         tangent,
         radial,
         up,
-        scale: 3.0 / side,
+        scale: WORLD_SIZE / shell,
     }
+}
+
+fn uv_ring_center() -> [f32; 3] {
+    [1.5, 1.5, 1.5]
+}
+
+fn uv_ring_angle_step(dims: [u32; 3]) -> f32 {
+    2.0 * std::f32::consts::PI / dims[0].max(1) as f32
+}
+
+fn uv_ring_radius() -> f32 {
+    3.0 * 0.38
+}
+
+fn uv_ring_shell(dims: [u32; 3]) -> f32 {
+    (uv_ring_radius() * uv_ring_angle_step(dims)).max(3.0 / 27.0)
+}
+
+fn wrap_angle_delta(mut delta: f32) -> f32 {
+    while delta <= -std::f32::consts::PI {
+        delta += 2.0 * std::f32::consts::PI;
+    }
+    while delta > std::f32::consts::PI {
+        delta -= 2.0 * std::f32::consts::PI;
+    }
+    delta
+}
+
+fn uv_ring_root_to_cell_local(dims: [u32; 3], cell_x: u32, p: [f32; 3]) -> [f32; 3] {
+    let center = uv_ring_center();
+    let d = crate::world::sdf::sub(p, center);
+    let r = crate::world::sdf::length(d).max(1e-6);
+    let lat = (d[1] / r).clamp(-1.0, 1.0).asin();
+    let lon = d[2].atan2(d[0]);
+    let angle_step = uv_ring_angle_step(dims);
+    let cell_angle = -std::f32::consts::PI + (cell_x as f32 + 0.5) * angle_step;
+    [
+        1.5 + wrap_angle_delta(lon - cell_angle) / angle_step * WORLD_SIZE,
+        1.5 + (r - uv_ring_radius()) / uv_ring_shell(dims) * WORLD_SIZE,
+        1.5 + lat / angle_step * WORLD_SIZE,
+    ]
 }
 
 pub(super) fn uv_ring_cell_path(cell_x: u32, slab_depth: u8) -> Path {
@@ -370,5 +405,18 @@ mod tests {
         let right = right_cell.point_to_ring_world([WORLD_SIZE, 1.48, 2.91]);
 
         assert_vec3_close(left, right);
+    }
+
+    #[test]
+    fn uv_ring_cell_local_round_trips_through_root_space() {
+        let dims = [27, 1, 1];
+        let slab_depth = 3;
+        let cell_x = 20;
+        let frame = uv_ring_cell_frame(dims, slab_depth, cell_x);
+        let local = [0.32, 1.48, 2.91];
+        let root = frame.point_to_ring_world(local);
+        let round_trip = uv_ring_root_to_cell_local(dims, cell_x, root);
+
+        assert_vec3_close(local, round_trip);
     }
 }

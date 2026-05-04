@@ -1,3 +1,62 @@
+fn make_uv_ring_hit(
+    pos: vec3<f32>, t_param: f32, inv_norm: f32,
+    block_type: u32,
+    r: f32, lat_p: f32, lon_p: f32,
+    lon_lo: f32, lon_hi: f32,
+    lat_lo: f32, lat_hi: f32,
+    r_lo: f32, r_hi: f32,
+) -> HitResult {
+    var result: HitResult;
+    let lon_step = lon_hi - lon_lo;
+    let lat_step = lat_hi - lat_lo;
+    let r_step = r_hi - r_lo;
+    let cos_lat = max(cos(lat_p), 1e-3);
+    let arc_lon_lo = r * cos_lat * abs(lon_p - lon_lo);
+    let arc_lon_hi = r * cos_lat * abs(lon_p - lon_hi);
+    let arc_lat_lo = r * abs(lat_p - lat_lo);
+    let arc_lat_hi = r * abs(lat_p - lat_hi);
+    let arc_r_lo = abs(r - r_lo);
+    let arc_r_hi = abs(r - r_hi);
+    var best = arc_lon_lo;
+    var axis: u32 = 0u;
+    if arc_lon_hi < best { best = arc_lon_hi; axis = 0u; }
+    if arc_lat_lo < best { best = arc_lat_lo; axis = 1u; }
+    if arc_lat_hi < best { best = arc_lat_hi; axis = 1u; }
+    if arc_r_lo < best { best = arc_r_lo; axis = 2u; }
+    if arc_r_hi < best { best = arc_r_hi; axis = 2u; }
+
+    let lon_in_cell = clamp((lon_p - lon_lo) / lon_step, 0.0, 1.0);
+    let lat_in_cell = clamp((lat_p - lat_lo) / lat_step, 0.0, 1.0);
+    let r_in_cell = clamp((r - r_lo) / r_step, 0.0, 1.0);
+    var u_in_face: f32;
+    var v_in_face: f32;
+    if axis == 0u {
+        u_in_face = lat_in_cell;
+        v_in_face = r_in_cell;
+    } else if axis == 1u {
+        u_in_face = lon_in_cell;
+        v_in_face = r_in_cell;
+    } else {
+        u_in_face = lon_in_cell;
+        v_in_face = lat_in_cell;
+    }
+    let face_edge = min(
+        min(u_in_face, 1.0 - u_in_face),
+        min(v_in_face, 1.0 - v_in_face),
+    );
+    let bevel = 0.7 + 0.3 * smoothstep(0.02, 0.14, face_edge);
+    let normal = normalize(pos - vec3<f32>(1.5));
+
+    result.hit = true;
+    result.t = t_param * inv_norm;
+    result.color = palette[block_type].rgb * bevel;
+    result.normal = normal;
+    result.frame_level = 0u;
+    result.frame_scale = 1.0;
+    result.cell_min = pos - vec3<f32>(0.5);
+    result.cell_size = 1.0;
+    return result;
+}
 
 fn march_uv_ring(
     ring_idx: u32,
@@ -18,129 +77,70 @@ fn march_uv_ring(
     let slab_depth = uniforms.slab_dims.w;
     if dims_x <= 0 { return result; }
 
+    let ray_len = length(ray_dir_in);
+    if ray_len <= 1e-8 { return result; }
+    let ray_dir = ray_dir_in / ray_len;
+    let inv_norm = 1.0 / ray_len;
+
     let center = body_origin + vec3<f32>(body_size * 0.5);
     let pi = 3.14159265;
-    let angle_step = 2.0 * pi / f32(dims_x);
+    let lon_step = 2.0 * pi / f32(dims_x);
     let radius = body_size * 0.38;
-    let side = max((2.0 * pi * radius / f32(dims_x)) * 0.95, body_size / 27.0);
+    let shell = max(radius * lon_step, body_size / 27.0);
+    let r_lo = radius - shell * 0.5;
+    let r_hi = radius + shell * 0.5;
+    let lat_lo = -lon_step * 0.5;
+    let lat_hi = lon_step * 0.5;
+    let oc = ray_origin - center;
 
+    var best = result;
     var best_t = 1e20;
-    var best: HitResult = result;
     for (var cell_x: i32 = 0; cell_x < dims_x; cell_x = cell_x + 1) {
-        let angle = -pi + (f32(cell_x) + 0.5) * angle_step;
-        let sa = sin(angle);
-        let ca = cos(angle);
-        let radial = vec3<f32>(ca, 0.0, sa);
-        let tangent = vec3<f32>(-sa, 0.0, ca);
-        let up = vec3<f32>(0.0, 1.0, 0.0);
-        let cube_origin = center + radial * radius;
-        let scale = 3.0 / side;
-        let d_origin = ray_origin - cube_origin;
-        let local_origin = vec3<f32>(
-            dot(tangent, d_origin) * scale + 1.5,
-            dot(radial, d_origin) * scale + 1.5,
-            dot(up, d_origin) * scale + 1.5,
-        );
-        let local_dir = vec3<f32>(
-            dot(tangent, ray_dir_in) * scale,
-            dot(radial, ray_dir_in) * scale,
-            dot(up, ray_dir_in) * scale,
-        );
-
-        let inv_local = vec3<f32>(
-            select(1e10, 1.0 / local_dir.x, abs(local_dir.x) > 1e-8),
-            select(1e10, 1.0 / local_dir.y, abs(local_dir.y) > 1e-8),
-            select(1e10, 1.0 / local_dir.z, abs(local_dir.z) > 1e-8),
-        );
-        let cube_box = ray_box(local_origin, inv_local, vec3<f32>(0.0), vec3<f32>(3.0));
-        if cube_box.t_enter >= cube_box.t_exit || cube_box.t_exit <= 0.0 {
-            continue;
-        }
-
         let sample = sample_slab_cell(ring_idx, slab_depth, cell_x, 0, 0);
         if sample.block_type == 0xFFFEu {
             continue;
         }
 
-        if sample.tag == 2u {
-            let aabb_bits = aabbs[sample.child_idx] & 0xFFFu;
-            if aabb_bits == 0u {
-                continue;
-            }
-            let amin = vec3<f32>(
-                f32(aabb_bits & 3u),
-                f32((aabb_bits >> 2u) & 3u),
-                f32((aabb_bits >> 4u) & 3u),
-            );
-            let amax = vec3<f32>(
-                f32(((aabb_bits >> 6u) & 3u) + 1u),
-                f32(((aabb_bits >> 8u) & 3u) + 1u),
-                f32(((aabb_bits >> 10u) & 3u) + 1u),
-            );
-            let content_box = ray_box(local_origin, inv_local, amin, amax);
-            if content_box.t_enter >= content_box.t_exit || content_box.t_exit <= 0.0 {
-                continue;
-            }
+        let lon_lo = -pi + f32(cell_x) * lon_step;
+        let lon_hi = lon_lo + lon_step;
+        var candidates: array<f32, 6>;
+        candidates[0] = ray_sphere_after(ray_origin, ray_dir, center, r_hi, 0.0);
+        candidates[1] = ray_sphere_after(ray_origin, ray_dir, center, r_lo, 0.0);
+        candidates[2] = ray_meridian_t(oc, ray_dir, lon_lo, 0.0);
+        candidates[3] = ray_meridian_t(oc, ray_dir, lon_hi, 0.0);
+        candidates[4] = ray_parallel_t(oc, ray_dir, lat_lo, 0.0);
+        candidates[5] = ray_parallel_t(oc, ray_dir, lat_hi, 0.0);
 
-            let sub = march_in_tangent_cube(sample.child_idx, local_origin, local_dir);
-            if sub.hit && sub.t < best_t {
-                let local_hit = local_origin + local_dir * sub.t;
-                let local_in_cell = clamp(
-                    (local_hit - sub.cell_min) / sub.cell_size,
-                    vec3<f32>(0.0), vec3<f32>(1.0),
-                );
-                let local_bevel = cube_face_bevel(local_in_cell, sub.normal);
-                var out: HitResult;
-                out.hit = true;
-                out.t = sub.t;
-                out.color = sub.color * (0.7 + 0.3 * local_bevel);
-                out.normal = tangent * sub.normal.x
-                           + radial * sub.normal.y
-                           + up * sub.normal.z;
-                out.frame_level = 0u;
-                out.frame_scale = 1.0;
-                let hit_world = ray_origin + ray_dir_in * sub.t;
-                out.cell_min = hit_world - vec3<f32>(0.5);
-                out.cell_size = 1.0;
-                best_t = sub.t;
-                best = out;
+        for (var i: u32 = 0u; i < 6u; i = i + 1u) {
+            let t = candidates[i];
+            if t <= 0.0 || t >= best_t {
+                continue;
             }
-        } else if sample.tag == 1u {
-            if cube_box.t_enter < cube_box.t_exit && cube_box.t_exit > 0.0 {
-                let t_local = max(cube_box.t_enter, 0.0);
-                if t_local < best_t {
-                    let entry_local = local_origin + local_dir * t_local;
-                    let dx_lo = abs(entry_local.x - 0.0);
-                    let dx_hi = abs(entry_local.x - 3.0);
-                    let dy_lo = abs(entry_local.y - 0.0);
-                    let dy_hi = abs(entry_local.y - 3.0);
-                    let dz_lo = abs(entry_local.z - 0.0);
-                    let dz_hi = abs(entry_local.z - 3.0);
-                    var best_face = dx_lo;
-                    var local_normal = vec3<f32>(-1.0, 0.0, 0.0);
-                    if dx_hi < best_face { best_face = dx_hi; local_normal = vec3<f32>(1.0, 0.0, 0.0); }
-                    if dy_lo < best_face { best_face = dy_lo; local_normal = vec3<f32>(0.0, -1.0, 0.0); }
-                    if dy_hi < best_face { best_face = dy_hi; local_normal = vec3<f32>(0.0, 1.0, 0.0); }
-                    if dz_lo < best_face { best_face = dz_lo; local_normal = vec3<f32>(0.0, 0.0, -1.0); }
-                    if dz_hi < best_face { best_face = dz_hi; local_normal = vec3<f32>(0.0, 0.0, 1.0); }
-                    let local_in_cell = clamp(entry_local / 3.0, vec3<f32>(0.0), vec3<f32>(1.0));
-                    let local_bevel = cube_face_bevel(local_in_cell, local_normal);
-                    var out: HitResult;
-                    out.hit = true;
-                    out.t = t_local;
-                    out.color = palette[sample.block_type].rgb * (0.7 + 0.3 * local_bevel);
-                    out.normal = tangent * local_normal.x
-                               + radial * local_normal.y
-                               + up * local_normal.z;
-                    out.frame_level = 0u;
-                    out.frame_scale = 1.0;
-                    let hit_world = ray_origin + ray_dir_in * t_local;
-                    out.cell_min = hit_world - vec3<f32>(0.5);
-                    out.cell_size = 1.0;
-                    best_t = t_local;
-                    best = out;
-                }
+            let pos = ray_origin + ray_dir * t;
+            let off = pos - center;
+            let r = length(off);
+            if r <= 1e-6 {
+                continue;
             }
+            let n = off / r;
+            let lat = asin(clamp(n.y, -1.0, 1.0));
+            let lon = atan2(n.z, n.x);
+            let eps = 1e-4;
+            if lon < lon_lo - eps || lon > lon_hi + eps {
+                continue;
+            }
+            if lat < lat_lo - eps || lat > lat_hi + eps {
+                continue;
+            }
+            if r < r_lo - eps || r > r_hi + eps {
+                continue;
+            }
+            best_t = t;
+            best = make_uv_ring_hit(
+                pos, t, inv_norm, sample.block_type,
+                r, lat, lon,
+                lon_lo, lon_hi, lat_lo, lat_hi, r_lo, r_hi,
+            );
         }
     }
 

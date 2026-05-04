@@ -9,6 +9,26 @@ fn ray_plane_t(origin: vec3<f32>, dir: vec3<f32>,
     return -dot(origin - through, plane_n) / denom;
 }
 
+fn ray_sphere_after(origin: vec3<f32>, dir: vec3<f32>,
+                    center: vec3<f32>, radius: f32, after: f32) -> f32 {
+    let oc = origin - center;
+    let b = dot(oc, dir);
+    let c = dot(oc, oc) - radius * radius;
+    let disc = b * b - c;
+    if disc < 0.0 { return -1.0; }
+    let sq = sqrt(disc);
+    let s = select(-1.0, 1.0, b >= 0.0);
+    let q = -b - s * sq;
+    if abs(q) < 1e-30 { return -1.0; }
+    let t0 = q;
+    let t1 = c / q;
+    let t_lo = min(t0, t1);
+    let t_hi = max(t0, t1);
+    if t_lo > after { return t_lo; }
+    if t_hi > after { return t_hi; }
+    return -1.0;
+}
+
 fn ray_box(origin: vec3<f32>, inv_dir: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> BoxHit {
     let t1 = (box_min - origin) * inv_dir;
     let t2 = (box_max - origin) * inv_dir;
@@ -50,6 +70,52 @@ fn cube_face_bevel(local: vec3<f32>, normal: vec3<f32>) -> f32 {
     let uv = face_uv_for_normal(local, normal);
     let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
     return smoothstep(0.02, 0.14, edge);
+}
+
+fn ray_meridian_t(oc: vec3<f32>, dir: vec3<f32>, lon_b: f32, after: f32) -> f32 {
+    let n = vec3<f32>(-sin(lon_b), 0.0, cos(lon_b));
+    let denom = dot(dir, n);
+    if abs(denom) < 1e-12 { return -1.0; }
+    let t = -dot(oc, n) / denom;
+    if t > after { return t; }
+    return -1.0;
+}
+
+fn ray_parallel_t(oc: vec3<f32>, dir: vec3<f32>, lat_b: f32, after: f32) -> f32 {
+    if abs(lat_b) < 1e-9 {
+        if abs(dir.y) < 1e-12 { return -1.0; }
+        let t = -oc.y / dir.y;
+        if t > after { return t; }
+        return -1.0;
+    }
+    let tan_l = tan(lat_b);
+    let tan2 = tan_l * tan_l;
+    let aa = (dir.x * dir.x + dir.z * dir.z) * tan2 - dir.y * dir.y;
+    let bb = 2.0 * ((oc.x * dir.x + oc.z * dir.z) * tan2 - oc.y * dir.y);
+    let cc = (oc.x * oc.x + oc.z * oc.z) * tan2 - oc.y * oc.y;
+    if abs(aa) < 1e-12 {
+        if abs(bb) < 1e-12 { return -1.0; }
+        let t = -cc / bb;
+        if t > after { return t; }
+        return -1.0;
+    }
+    let disc = bb * bb - 4.0 * aa * cc;
+    if disc < 0.0 { return -1.0; }
+    let sq = sqrt(disc);
+    let t0 = (-bb - sq) / (2.0 * aa);
+    let t1 = (-bb + sq) / (2.0 * aa);
+    let t_lo = min(t0, t1);
+    let t_hi = max(t0, t1);
+    let want_pos = lat_b > 0.0;
+    if t_lo > after {
+        let y_at = oc.y + t_lo * dir.y;
+        if (y_at > 0.0) == want_pos { return t_lo; }
+    }
+    if t_hi > after {
+        let y_at = oc.y + t_hi * dir.y;
+        if (y_at > 0.0) == want_pos { return t_hi; }
+    }
+    return -1.0;
 }
 
 // Branchless argmin mask for the DDA min-side_dist selection.
